@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# One local terminal == one persistent remote session on the k3s workspace.
+#
+# Run it inside a git repo (or one of its worktrees) and you get a session for
+# THAT checkout. The repo is cloned to ~/work/<repo> on the server once.
+#
+# Bare `agent` resumes the first session of this checkout that nobody is attached
+# to, and opens the next one when they are all busy. It never mirrors.
+#
+#   agent               resume a free session here, else open the next one
+#   agent -n [label]    force a NEW session   (-n rates -> repo@rates)
+#   agent -m            mirror: deliberately join a session already in use
+#   agent -l            list just this project's sessions, with client counts
+#   agent resume | r    picker over all sessions, this project first
+#   agent ls            all sessions + client counts
+#   agent wt            open a session in an existing server-side worktree
+#   agent fix [name]    repair a corrupted / wrong-sized UI
+#   agent handoff       move this checkout's Claude conversation to the server
+#   agent scratch       a plain t1/t2 scratch session
+#   agent killall       kill every session of this project
+#   agent <name>        attach by exact name
+#   agent kill <name>   delete a session
+#   agent gh-login      log the workspace into GitHub (one time)
+#   agent shell         plain bash, no zellij
+#   agent sync          push local config changes, pull them into the pod
+set -uo pipefail
+# ---- configuration -------------------------------------------------------
+# Override any of these in ~/.config/agent-workspace/config, or via the
+# environment. Nothing here is machine-specific by default.
+CONFIG="${AGENT_CONFIG:-$HOME/.config/agent-workspace/config}"
+# shellcheck source=/dev/null
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+CTX="${AGENT_CONTEXT:-${CTX:-}}"                    # kubectl context; empty = current
+NS="${AGENT_NAMESPACE:-${NS:-agent}}"
+APP="${AGENT_APP:-${APP:-workspace}}"
+CON="${AGENT_CONTAINER:-${CON:-workspace}}"
+REMOTE_HOME="${AGENT_REMOTE_HOME:-${REMOTE_HOME:-/home/node}}"
+WORKDIR="${AGENT_WORKDIR:-${WORKDIR:-$REMOTE_HOME/work}}"
+
+if [ -n "$CTX" ]; then KCTX=(--context="$CTX"); else KCTX=(); fi
+
+POD=$(kubectl "${KCTX[@]}" get pod -n "$NS" -l app="$APP" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+[ -n "${POD:-}" ] || { echo "agent: workspace pod not running" >&2; exit 1; }
+
+kex() { kubectl "${KCTX[@]}" exec -n "$NS" "$POD" -c "$CON" -- bash -lc "$1" 2>/dev/null; }
+
+# Local terminal geometry, resolved HERE so the remote pty starts at the right
+# size instead of racing kubectl's first resize event (the 80x24 startup bug).
+term_size() {
+  local r c
+  read -r r c < <(stty size 2>/dev/null) || true
+  [ -n "${r:-}" ] || r=$(tput lines 2>/dev/null)
+  [ -n "${c:-}" ] || c=$(tput cols 2>/dev/null)
+  printf '%s %s' "${r:-24}" "${c:-80}"
+}
+
+# Attach primitive. Forces the remote pty geometry and TERM before handing off.
+kati() {
+  local r c; read -r r c < <(term_size)
+  exec kubectl "${KCTX[@]}" exec -it -n "$NS" "$POD" -c "$CON" -- \
+    bash -lc "export TERM='${TERM:-xterm-256color}'; stty rows $r cols $c 2>/dev/null; $1"
+}
+
+# ---------- session inventory: name <TAB> attached-clients <TAB> status ----------
+INV=; INV_OK=
+inv() {
+  if [ -z "$INV_OK" ]; then
+    INV=$(kex '
+      zellij list-sessions --no-formatting 2>/dev/null | tr -d "\r" |
+      while read -r s rest; do
+        case "$s" in ""|No) continue ;; esac
+        c=$(zellij --session "$s" action list-clients 2>/dev/null | grep -cE "^[0-9]+[[:space:]]")
+        printf "%s\t%s\t%s\n" "$s" "$c" "$rest"
+      done')
+    INV_OK=1
+  fi
+  [ -n "$INV" ] && printf '%s\n' "$INV"
+  return 0
+}
+names() { inv | cut -f1; }
+next_free() { local n=1 all; all=$(names); while printf '%s\n' "$all" | grep -qxF "t$n"; do n=$((n+1)); done; printf 't%s' "$n"; }
+
+slug_of() { sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##' <<<"$1"; }
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-*$//'; }
+
+fam_rows() { inv | awk -F'\t' -v b="$1" '
+              $1==b { print; next }
+              index($1,b)==1 { t=substr($1,length(b)+1); if (t ~ /^[@-][0-9]+$/) print }'; }
+
+uniq_name() {
+  local b=$1 n=2 sep all; all=$(names)
+  case "$b" in *@*) sep='-' ;; *) sep='@' ;; esac
+  printf '%s\n' "$all" | grep -qxF "$b" || { printf '%s' "$b"; return; }
+  while printf '%s\n' "$all" | grep -qxF "$b$sep$n"; do n=$((n+1)); done
+  printf '%s%s%s' "$b" "$sep" "$n"
+}
+
+# main checkout even when cwd is a linked worktree (git >= 2.31)
+repo_root()   { local g; g=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1; dirname "$g"; }
+cur_project() { local r; r=$(repo_root) || return 1; sanitize "$(basename "$r")"; }
+
+pick() {
+  local prompt=$1 list; list=$(cat)
+  [ -n "$list" ] || return 1
+  if [ "$(printf '%s\n' "$list" | wc -l)" -eq 1 ]; then printf '%s\n' "$list"; return 0; fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "$list" | fzf --prompt="$prompt > " --height=40% --reverse --no-sort
+  else
+    printf '%s\n' "$list" | nl -w2 -s') ' >&2; read -rp "number: " i
+    sed -n "${i}p" <<<"$list"
+  fi
+}
+
+fmt_rows() { awk -F'\t' '{a=($2==0?"idle":$2" client"($2>1?"s":"")); s=$3
+                          gsub(/[][]/,"",s); sub(/^Created /,"",s)
+                          printf "%-26s %-10s %s\n",$1,a,s}'; }
+
+gh_login() {
+  echo "Logging the workspace into GitHub (device flow — follow the prompts):"
+  kubectl "${KCTX[@]}" exec -it -n "$NS" "$POD" -c "$CON" -- \
+    bash -lc 'gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && gh auth status'
+}
+
+project_session() {
+  local mode=${1:-auto} label=${2:-}
+  local top root name slug branch wt= base sess probe state dir
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+  root=$(repo_root)                                || return 1
+  slug=$(git remote get-url origin 2>/dev/null)    || return 1
+  slug=$(slug_of "$slug")
+  name=$(sanitize "$(basename "$root")")
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$top" = "$root" ] || wt=$(sanitize "$(basename "$top")")
+
+  probe=$(kex "d=\$HOME/work/$name
+    if [ -d \"\$d\" ]; then s=have; else gh auth status >/dev/null 2>&1 && s=clone || s=nologin; fi
+    w='$wt'; [ -n \"\$w\" ] && [ -d \"\$d/.claude/worktrees/\$w\" ] && d=\$d/.claude/worktrees/\$w
+    printf '%s\t%s\n' \"\$s\" \"\$d\"")
+  state=${probe%%$'\t'*}; dir=${probe#*$'\t'}
+  case "$state" in
+    nologin) echo "The workspace isn't logged into GitHub yet."
+             echo "Run:  agent gh-login"; return 2 ;;
+    clone)   echo "cloning $slug into $WORKDIR/$name ..."
+             kex "mkdir -p "$WORKDIR" && gh repo clone $slug $WORKDIR/$name -- -q && \
+                  cd "$WORKDIR"/$name && (git checkout -q '$branch' 2>/dev/null || true)" \
+               || { echo "agent: clone failed" >&2; return 2; } ;;
+  esac
+
+  base="$name"; [ -n "$wt" ] && base="$name@$wt"
+  case "$mode" in
+    new)    [ -n "$label" ] && base="$name@$(sanitize "$label")"
+            sess=$(uniq_name "$base") ;;
+    mirror) sess=$(fam_rows "$base" | awk -F'\t' 'NR==1{print $1}'); [ -n "$sess" ] || sess=$base ;;
+    *)      sess=$(fam_rows "$base" | awk -F'\t' '$2==0 {print $1; exit}')
+            [ -n "$sess" ] || sess=$(uniq_name "$base") ;;
+  esac
+
+  printf '%s  (branch %s)\n' "$sess" "${branch:-?}"
+  kati "cd '$dir' 2>/dev/null || cd "$WORKDIR"/$name; zellij attach -c '$sess'"
+}
+
+case "${1:-auto}" in
+  ls|list)   r=$(inv | fmt_rows); [ -n "$r" ] && printf '%s\n' "$r" || echo "no sessions yet" ;;
+  kill|rm)   [ -n "${2:-}" ] || { echo "usage: agent kill <name>" >&2; exit 1; }
+             kex "zellij delete-session --force '$2'" >/dev/null; echo "killed: $2" ;;
+  killall)   p=$(cur_project) || { echo "agent killall: not in a git repo" >&2; exit 1; }
+             for s in $(inv | awk -F'\t' -v p="$p" '$1==p || index($1,p "@")==1 {print $1}'); do
+               kex "zellij delete-session --force '$s'" >/dev/null; echo "killed: $s"; done ;;
+  gh-login)  gh_login; exit 0 ;;
+  shell|sh)  kati 'cd "$WORKDIR" 2>/dev/null; bash -l' ;;
+  scratch)   n=$(next_free); echo "scratch session: $n"; kati "cd "$WORKDIR" && zellij attach -c $n" ;;
+  -n|new)    project_session new "${2:-}"; rc=$?
+             [ $rc -eq 2 ] && exit 1
+             n=$(next_free); echo "not in a git repo — scratch session: $n"
+             kati "cd "$WORKDIR" && zellij attach -c $n" ;;
+  -m|mirror) project_session mirror || { echo "agent -m: not in a git repo" >&2; exit 1; } ;;
+  -l|here)   p=$(cur_project) || { echo "agent -l: not in a git repo" >&2; exit 1; }
+             r=$(inv | awk -F'\t' -v p="$p" '$1==p || index($1,p "@")==1' | fmt_rows)
+             [ -n "$r" ] && printf '%s\n' "$r" || echo "no sessions for $p yet" ;;
+  fix)
+      # zellij sizes a session to its SMALLEST attached client. A kubectl exec that
+      # died without cleanup leaves a client process behind holding a stale (often
+      # tiny) pty, which pins the whole session small — the frame draws at full size
+      # but the content stays in a corner. Cure: kill every client process for this
+      # session (the SERVER and your panes survive), then reattach at real size.
+      sel=${2:-}
+      if [ -z "$sel" ]; then p=$(cur_project 2>/dev/null) || p=
+        [ -n "$p" ] && sel=$(fam_rows "$p" | awk -F'\t' 'NR==1{print $1}')
+      fi
+      [ -n "$sel" ] || { echo "usage: agent fix <session>   (or run inside a repo)" >&2
+                         inv | fmt_rows; exit 1; }
+      read -r R C < <(term_size)
+      echo "repairing '$sel' — detaches ALL terminals viewing it, then reattaches you"
+      kex "for q in \$(pgrep -f '^zellij attach' 2>/dev/null); do
+             tr '\\0' ' ' < /proc/\$q/cmdline 2>/dev/null | grep -qw '$sel' || continue
+             kill -9 \$q 2>/dev/null && echo \"  detached stale client pid=\$q\"
+           done
+           pgrep -f 'zellij --server' >/dev/null 2>&1 && echo '  session server intact'"
+      echo "  reattaching at ${C}x${R}"
+      printf '\033c'
+      kati "zellij attach -c '$sel'" ;;
+  handoff)
+      # Ship THIS checkout's most recent Claude conversation to the server and
+      # reopen it there already resumed, so you can just type "continue".
+      #
+      # Claude Code stores transcripts at
+      #   ~/.claude/projects/<cwd with / and . replaced by ->/<session-uuid>.jsonl
+      # and `claude --resume <uuid>` reopens one. The transcript embeds absolute
+      # paths, so they are rewritten from the local checkout to the server one.
+      top=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "agent handoff: run this inside a git repo" >&2; exit 1; }
+      root=$(repo_root); name=$(sanitize "$(basename "$root")")
+      LOCAL_DIR="$HOME/.claude/projects/$(printf '%s' "$top" | tr '/.' '--')"
+      [ -d "$LOCAL_DIR" ] || { echo "no local conversations recorded for $top" >&2; exit 1; }
+
+      sel=${2:-}
+      if [ -z "$sel" ]; then
+        rows=$(ls -t "$LOCAL_DIR"/*.jsonl 2>/dev/null | head -20 | while read -r f; do
+                 printf '%-38s %6s  %s\n' "$(basename "$f" .jsonl)" \
+                   "$(du -h "$f" | cut -f1)" "$(date -r "$f" '+%Y-%m-%d %H:%M')"
+               done)
+        [ -n "$rows" ] || { echo "no conversations found in $LOCAL_DIR" >&2; exit 1; }
+        sel=$(printf '%s\n' "$rows" | pick "conversation" | awk '{print $1}')
+        [ -n "${sel:-}" ] || exit 0
+      fi
+      SRC="$LOCAL_DIR/$sel.jsonl"
+      [ -f "$SRC" ] || { echo "no such conversation: $sel" >&2; exit 1; }
+
+      SZ=$(du -m "$SRC" | cut -f1)
+      echo "conversation  $sel  (${SZ} MB)"
+      if [ "$SZ" -gt 60 ]; then
+        printf 'that is large; the copy may take a while. continue? [y/N] '
+        read -r a; case "$a" in y|Y) ;; *) echo "aborted"; exit 0 ;; esac
+      fi
+
+      REMOTE_CWD="$WORKDIR/$name"
+      REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
+      TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+      # rewrite embedded paths: bare form, then the JSON-escaped \/ form
+      esc_l=$(printf '%s' "$top"        | sed 's#/#\\\\/#g')
+      esc_r=$(printf '%s' "$REMOTE_CWD" | sed 's#/#\\\\/#g')
+      sed -e "s#$top#$REMOTE_CWD#g" -e "s#$esc_l#$esc_r#g" "$SRC" > "$TMP/$sel.jsonl"
+      echo "rewrote       $top -> $REMOTE_CWD"
+
+      kex "mkdir -p '$REMOTE_DIR' '$REMOTE_CWD' ~/.config/zellij/layouts" >/dev/null
+      echo "copying ..."
+      kubectl "${KCTX[@]}" cp "$TMP/$sel.jsonl" \
+        "$NS/$POD:$REMOTE_DIR/$sel.jsonl" -c "$CON" >/dev/null 2>&1 \
+        || { echo "agent handoff: copy failed" >&2; exit 1; }
+      kex "ls -lh '$REMOTE_DIR/$sel.jsonl' | awk '{print \"  copied \" \$5}'"
+
+      # a one-pane layout that boots straight into the resumed conversation
+      kex "printf 'layout {\n    pane command=\"%s\" cwd=\"%s\" {\n        args \"--resume\" \"%s\"\n    }\n}\n' \
+             \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
+             > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
+
+      s=$(uniq_name "$name")
+      echo "opening '$s' with the conversation resumed — then just type: continue"
+      kati "cd '$REMOTE_CWD'; zellij --session '$s' --layout resume-$sel" ;;
+  wt)
+      p=$(cur_project) || { echo "agent wt: not in a git repo" >&2; exit 1; }
+      sel=$(kex "ls -1 $WORKDIR/$p/.claude/worktrees 2>/dev/null" | tr -d '\r' | sed '/^$/d' | pick "worktree")
+      [ -n "${sel:-}" ] || { echo "no server-side worktrees under $WORKDIR/$p"; exit 0; }
+      kati "cd "$WORKDIR"/$p/.claude/worktrees/$sel && zellij attach -c '$p@$sel'" ;;
+  sync)
+      # NOTE: this pushes the dotfiles repo's own default branch. That is the
+      # intended flow for a personal config repo, and is unrelated to the
+      # never-push-to-main rule that applies to code repos.
+      echo "--- local: commit + push config ---"
+      chezmoi re-add >/dev/null 2>&1 || true
+      SRC=$(chezmoi source-path)
+      if [ -n "$(git -C "$SRC" status --porcelain)" ]; then
+        git -C "$SRC" add -A
+        git -C "$SRC" commit -q -m "config: sync from $(hostname) $(date -u +%F)"
+        git -C "$SRC" push -q origin HEAD && echo "pushed"
+      else echo "nothing to push"; fi
+      echo "--- pod: pull + apply ---"
+      kex 'chezmoi update --force 2>&1 | tail -3; echo applied' ;;
+  resume|r)
+      rows=$(inv)
+      [ -n "$rows" ] || { echo "no sessions — starting one"; n=$(next_free); kati "cd "$WORKDIR" && zellij attach -c $n"; }
+      here=$(cur_project) || here=
+      sel=$(printf '%s\n' "$rows" | awk -F'\t' -v here="$here" '
+              { g=$1; sub(/@.*/,"",g); key=(g==here?"0":"1") g
+                a=($2==0?"idle":$2" client"($2>1?"s":"")); s=$3
+                gsub(/[][]/,"",s); sub(/^Created /,"",s); sub(/ ago$/,"",s)
+                printf "%s\t%-26s %-10s %s\n",key,$1,a,s }' \
+            | sort -t"$(printf '\t')" -k1,1 -s | cut -f2- | pick "resume" | awk '{print $1}')
+      [ -n "${sel:-}" ] || exit 0
+      kati "zellij attach -c '$sel'" ;;
+  auto)
+      project_session auto; rc=$?
+      [ $rc -eq 2 ] && exit 1
+      n=$(next_free); echo "not in a git repo — scratch session: $n"
+      kati "cd "$WORKDIR" && zellij attach -c $n" ;;
+  *)  kati "zellij attach -c '$1'" ;;
+esac

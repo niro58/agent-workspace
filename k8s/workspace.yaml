@@ -1,0 +1,232 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-docker
+  namespace: agent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-bootstrap
+  namespace: agent
+data:
+  install-tools.sh: |
+    #!/usr/bin/env bash
+    # Rootless toolchain install. Everything lands on the PVC under ~/.local/bin.
+    set -u
+    export HOME=/home/node
+    export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+    BIN="$HOME/.local/bin"; PATH="$BIN:$NPM_CONFIG_PREFIX/bin:$PATH"
+    mkdir -p "$BIN" "$HOME/.cache/dl"
+    TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+    tag() { curl -fsSL "https://api.github.com/repos/$1/releases/latest" 2>/dev/null | grep -m1 '"tag_name"' | cut -d'"' -f4; }
+    have() { command -v "$1" >/dev/null 2>&1; }
+
+    # ---- pnpm (their package manager) + npm-based tools
+    have pnpm || { echo ">> pnpm";  npm i -g pnpm  >/dev/null 2>&1; }
+
+    # ---- jq (unversioned asset URL)
+    have jq || { echo ">> jq"; curl -fsSL -o "$BIN/jq" \
+      https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64 && chmod +x "$BIN/jq"; }
+
+    # ---- kubectl
+    have kubectl || { echo ">> kubectl"; V=$(curl -fsSL https://dl.k8s.io/release/stable.txt); \
+      curl -fsSL -o "$BIN/kubectl" "https://dl.k8s.io/release/$V/bin/linux/amd64/kubectl" && chmod +x "$BIN/kubectl"; }
+
+    # ---- ripgrep
+    have rg || { echo ">> ripgrep"; T=$(tag BurntSushi/ripgrep); V=${T#v}; \
+      curl -fsSL "https://github.com/BurntSushi/ripgrep/releases/download/$T/ripgrep-$V-x86_64-unknown-linux-musl.tar.gz" \
+      | tar xz -C "$TMP" && find "$TMP" -name rg -type f -exec cp {} "$BIN/" \; && chmod +x "$BIN/rg"; }
+
+    # ---- fd
+    have fd || { echo ">> fd"; T=$(tag sharkdp/fd); V=${T#v}; \
+      curl -fsSL "https://github.com/sharkdp/fd/releases/download/$T/fd-$T-x86_64-unknown-linux-musl.tar.gz" \
+      | tar xz -C "$TMP" && find "$TMP" -name fd -type f -exec cp {} "$BIN/" \; && chmod +x "$BIN/fd"; }
+
+    # ---- fzf
+    have fzf || { echo ">> fzf"; T=$(tag junegunn/fzf); V=${T#v}; \
+      curl -fsSL "https://github.com/junegunn/fzf/releases/download/$T/fzf-$V-linux_amd64.tar.gz" \
+      | tar xz -C "$BIN" && chmod +x "$BIN/fzf"; }
+
+    # ---- gh
+    have gh || { echo ">> gh"; T=$(tag cli/cli); V=${T#v}; \
+      curl -fsSL "https://github.com/cli/cli/releases/download/$T/gh_${V}_linux_amd64.tar.gz" \
+      | tar xz -C "$TMP" && find "$TMP" -name gh -type f -perm -u+x -exec cp {} "$BIN/" \; && chmod +x "$BIN/gh"; }
+
+    # ---- chezmoi (the config-sync tool itself)
+    have chezmoi || { echo ">> chezmoi"; curl -fsSL https://get.chezmoi.io | sh -s -- -b "$BIN" >/dev/null 2>&1; }
+
+    # ---- mise (per-project node/tool versions -> parity with the PC)
+    have mise || { echo ">> mise"; curl -fsSL https://mise.run | MISE_INSTALL_PATH="$BIN/mise" sh >/dev/null 2>&1; }
+
+    # ---- rtk: the PreToolUse hook shells out to this, so the pod is broken without it.
+    #      musl build (the Arch binary needs glibc 2.43; this image has 2.36) and pinned
+    #      to the version on the desktop so hook behaviour matches exactly.
+    have rtk || { echo ">> rtk"
+      curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/v0.38.0/rtk-x86_64-unknown-linux-musl.tar.gz" \
+        | tar xz -C "$TMP" 2>/dev/null
+      F=$(find "$TMP" -name rtk -type f -perm -u+x | head -1)
+      [ -n "$F" ] && cp "$F" "$BIN/rtk" && chmod +x "$BIN/rtk"; }
+
+    # ---- docker CLI + compose plugin (client only; the daemon is the dind sidecar)
+    have docker || { echo ">> docker cli"
+      curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz" \
+        | tar xz -C "$TMP" 2>/dev/null && cp "$TMP/docker/docker" "$BIN/docker" && chmod +x "$BIN/docker"; }
+    [ -x "$HOME/.docker/cli-plugins/docker-compose" ] || { echo ">> docker compose"
+      mkdir -p "$HOME/.docker/cli-plugins"
+      curl -fsSL -o "$HOME/.docker/cli-plugins/docker-compose" \
+        "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
+        && chmod +x "$HOME/.docker/cli-plugins/docker-compose"; }
+
+    echo
+    echo "=== result ==="
+    for b in node npm pnpm git zellij claude codex rtk jq rg fd fzf gh kubectl chezmoi mise docker; do
+      if have "$b"; then printf '%-9s %s\n' "$b" "$("$b" --version 2>&1 | head -1 | cut -c1-48)"
+      else printf '%-9s %s\n' "$b" "FAILED"; fi
+    done
+
+  bootstrap.sh: |
+    #!/usr/bin/env bash
+    # Idempotent: everything lands on the PVC, so restarts are fast.
+    set -u
+    export HOME=/home/node
+    export NPM_CONFIG_PREFIX="$HOME/.npm-global"
+    export PATH="$HOME/.local/bin:$NPM_CONFIG_PREFIX/bin:$PATH"
+    mkdir -p "$HOME/.local/bin" "$NPM_CONFIG_PREFIX" "$HOME/work" "$HOME/.config"
+
+    if ! grep -q NPM_CONFIG_PREFIX "$HOME/.bashrc" 2>/dev/null; then
+      {
+        echo 'export NPM_CONFIG_PREFIX="$HOME/.npm-global"'
+        echo 'export PATH="$HOME/.local/bin:$NPM_CONFIG_PREFIX/bin:$PATH"'
+        echo 'export EDITOR=vi'
+        echo 'cd ~/work 2>/dev/null || true'
+      } >> "$HOME/.bashrc"
+    fi
+
+    # login shells (kubectl exec -- bash -lc, ssh) must pick up the same PATH
+    if [ ! -f "$HOME/.bash_profile" ]; then
+      echo '[ -f ~/.bashrc ] && . ~/.bashrc' > "$HOME/.bash_profile"
+    fi
+
+    if [ ! -x "$HOME/.local/bin/zellij" ]; then
+      echo ">> installing zellij"
+      curl -fsSL https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | tar xz -C "$HOME/.local/bin"
+      chmod +x "$HOME/.local/bin/zellij" 2>/dev/null || true
+    fi
+
+    command -v claude >/dev/null 2>&1 || { echo ">> installing claude code"; npm i -g @anthropic-ai/claude-code >/dev/null 2>&1; }
+    command -v codex  >/dev/null 2>&1 || { echo ">> installing codex";       npm i -g @openai/codex           >/dev/null 2>&1; }
+
+    bash /opt/bootstrap/install-tools.sh >/dev/null 2>&1 || true
+
+    echo "=== ready ==="
+    for b in node npm pnpm git zellij claude codex rtk jq rg fd fzf gh kubectl chezmoi mise docker; do
+      if command -v "$b" >/dev/null 2>&1; then
+        printf '%-8s %s\n' "$b" "$("$b" --version 2>&1 | head -1)"
+      else
+        printf '%-8s %s\n' "$b" "MISSING"
+      fi
+    done
+    exec sleep infinity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workspace
+  namespace: agent
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: workspace }
+  template:
+    metadata:
+      labels: { app: workspace }
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: browser-deps
+          image: node:22-bookworm
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              D=/home/node/.local/browserdeps
+              if [ -f "$D/.done" ]; then echo "browser deps already installed"; exit 0; fi
+              echo "installing playwright system deps (root, one time)"
+              ls /usr/lib/x86_64-linux-gnu > /tmp/before.txt
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              npx --yes playwright@1.58.2 install-deps chromium >/dev/null
+              ls /usr/lib/x86_64-linux-gnu > /tmp/after.txt
+              mkdir -p "$D/lib" "$D/fonts"
+              comm -13 /tmp/before.txt /tmp/after.txt | while read -r f; do
+                cp -a "/usr/lib/x86_64-linux-gnu/$f" "$D/lib/" 2>/dev/null || true
+              done
+              cp -a /usr/share/fonts/. "$D/fonts/" 2>/dev/null || true
+              echo "copied $(ls -1 "$D/lib" | wc -l) libraries"
+              touch "$D/.done"
+          volumeMounts:
+            - { name: home, mountPath: /home/node }
+        - name: fix-perms
+          image: busybox:1.36
+          command: ["sh","-c","mkdir -p /home/node && chown -R 1000:1000 /home/node"]
+          volumeMounts:
+            - { name: home, mountPath: /home/node }
+      containers:
+        - name: workspace
+          image: node:22-bookworm
+          command: ["bash","/opt/bootstrap/bootstrap.sh"]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          env:
+            - { name: HOME,  value: /home/node }
+            - { name: SHELL, value: /bin/bash }
+            - { name: TERM,  value: xterm-256color }
+            - { name: DOCKER_HOST, value: "unix:///var/run/docker-shared/docker.sock" }
+            - { name: LD_LIBRARY_PATH, value: "/home/node/.local/browserdeps/lib" }
+            - { name: XDG_DATA_HOME,   value: "/home/node/.local/share" }
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "3",    memory: "6Gi" }
+          volumeMounts:
+            - { name: home,       mountPath: /home/node }
+            - { name: bootstrap,  mountPath: /opt/bootstrap }
+            - { name: dockersock, mountPath: /var/run/docker-shared }
+        - name: dind
+          image: docker:27-dind
+          securityContext:
+            privileged: true
+          # Bypass dockerd-entrypoint.sh: it force-adds a tcp://0.0.0.0:2375
+          # listener, which would expose an unauthenticated root-equivalent API
+          # to every pod on the cluster. Socket-only, shared via emptyDir, and
+          # group-owned by gid 1000 so the uid-1000 workspace can use it.
+          command: ["dockerd"]
+          args:
+            - "--host=unix:///var/run/docker-shared/docker.sock"
+            - "--group=1000"
+          resources:
+            requests: { cpu: "50m",  memory: "128Mi" }
+            limits:   { cpu: "2",    memory: "4Gi" }
+          volumeMounts:
+            - { name: dockerlib,  mountPath: /var/lib/docker }
+            - { name: dockersock, mountPath: /var/run/docker-shared }
+      volumes:
+        - name: home
+          persistentVolumeClaim: { claimName: agent-home }
+        - name: bootstrap
+          configMap: { name: agent-bootstrap }
+        - name: dockerlib
+          persistentVolumeClaim: { claimName: agent-docker }
+        - name: dockersock
+          emptyDir: {}

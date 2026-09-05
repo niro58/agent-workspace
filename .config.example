@@ -1,0 +1,9 @@
+# Copy to ~/.config/agent-workspace/config
+# Every value is optional; these are the defaults.
+
+# CTX=my-cluster          # kubectl context. Omit to use the current one.
+# NS=agent                # namespace the workspace runs in
+# APP=workspace           # pod label selector
+# CON=workspace           # container name
+# REMOTE_HOME=/home/node  # the container user's home (must match the image's uid 1000)
+# WORKDIR=/home/node/work # where repos are cloned in the pod
