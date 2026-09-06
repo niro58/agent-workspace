@@ -23,6 +23,7 @@
 #   agent gh-login      log the workspace into GitHub (one time)
 #   agent shell         plain bash, no zellij
 #   agent sync          push local config changes, pull them into the pod
+#   agent env <cmd>     encrypted project secrets: push | pull | ship | status
 set -uo pipefail
 # ---- configuration -------------------------------------------------------
 # Override any of these in ~/.config/agent-workspace/config, or via the
@@ -259,6 +260,105 @@ case "${1:-auto}" in
       s=$(uniq_name "$name")
       echo "opening '$s' with the conversation resumed — then just type: continue"
       kati "cd '$REMOTE_CWD'; zellij --session '$s' --layout resume-$sel" ;;
+  env)
+      # Encrypted project secrets. The age private key lives ONLY on this machine
+      # (~/.config/sops/age/keys.txt); the workspace receives decrypted files, so a
+      # compromised pod cannot decrypt the vault for projects it has never seen.
+      #
+      #   agent env push    local repo  -> vault   (encrypt, commit, push)
+      #   agent env pull    vault       -> local repo
+      #   agent env ship    vault       -> the pod's clone of this repo
+      #   agent env status  what the vault holds for this repo vs what is on disk
+      VAULT="${AGENT_VAULT:-$HOME/.local/share/agent-env-vault}"
+      root=$(repo_root) || { echo "agent env: run inside a git repo" >&2; exit 1; }
+      name=$(sanitize "$(basename "$root")")
+
+      # gitignored .env files, excluding examples, backups and worktree copies
+      env_files() {
+        find "$1" -name '.env*' \
+          -not -path '*/node_modules/*' -not -path '*/.git/*' \
+          -not -path '*/.claude/worktrees/*' -not -path '*/.claude-worktrees/*' \
+          -not -path '*/.worktrees/*' \
+          -not -name '*.example' -not -name '*.bak' -not -name '*.bak-*' -not -name '*.bak.*' \
+          2>/dev/null | sort | while read -r f; do
+            r=${f#"$1"/}
+            git -C "$1" check-ignore -q "$r" 2>/dev/null && printf '%s\n' "$r"
+          done
+      }
+
+      errf=$(mktemp); trap 'rm -f "$errf"' EXIT
+
+      case "${2:-status}" in
+        push)
+            [ -d "$VAULT/.git" ] || { echo "agent env: no vault at $VAULT" >&2; exit 1; }
+            n=0
+            while read -r r; do
+              [ -n "$r" ] || continue
+              mkdir -p "$VAULT/$name/$(dirname "$r")"
+              if sops --config "$VAULT/.sops.yaml" --encrypt --input-type dotenv --output-type dotenv \
+                   "$root/$r" > "$VAULT/$name/$r" 2>"$errf"; then
+                printf '  encrypted  %s\n' "$r"; n=$((n+1))
+              else
+                printf '  FAILED     %s — %s\n' "$r" "$(head -1 "$errf")" >&2
+                rm -f "$VAULT/$name/$r"
+              fi
+            done <<EOF
+$(env_files "$root")
+EOF
+            [ "$n" -gt 0 ] || { echo "no env files found for $name"; exit 0; }
+            if [ -n "$(git -C "$VAULT" status --porcelain)" ]; then
+              git -C "$VAULT" add -A
+              git -C "$VAULT" commit -q -m "$name: $n env file(s) from $(hostname)"
+              git -C "$VAULT" push -q origin HEAD 2>/dev/null && echo "pushed $n file(s) to the vault"
+            else
+              echo "$n file(s) encrypted, no changes to commit"
+            fi ;;
+
+        pull|load)
+            [ -d "$VAULT/$name" ] || { echo "vault has nothing for $name" >&2; exit 1; }
+            git -C "$VAULT" pull -q --ff-only 2>/dev/null || true
+            ( cd "$VAULT/$name" && find . -type f ! -name '*.md' | sed 's#^\./##' ) | while read -r r; do
+              mkdir -p "$root/$(dirname "$r")"
+              if sops --config "$VAULT/.sops.yaml" --decrypt --input-type dotenv --output-type dotenv \
+                   "$VAULT/$name/$r" > "$root/$r" 2>/dev/null; then
+                chmod 600 "$root/$r"; printf '  restored  %s\n' "$r"
+              else
+                echo "  FAILED    $r" >&2
+              fi
+            done ;;
+
+        ship)
+            [ -d "$VAULT/$name" ] || { echo "vault has nothing for $name" >&2; exit 1; }
+            kex "test -d '$WORKDIR/$name'" >/dev/null 2>&1 \
+              || { echo "agent env: $name is not cloned in the workspace yet — run 'agent' first" >&2; exit 1; }
+            TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+            n=0
+            ( cd "$VAULT/$name" && find . -type f ! -name '*.md' | sed 's#^\./##' ) | while read -r r; do
+              mkdir -p "$TMP/$(dirname "$r")"
+              sops --config "$VAULT/.sops.yaml" --decrypt --input-type dotenv --output-type dotenv \
+                "$VAULT/$name/$r" > "$TMP/$r" 2>/dev/null || { echo "  FAILED  $r" >&2; continue; }
+              kex "mkdir -p '$WORKDIR/$name/$(dirname "$r")'" >/dev/null
+              if kubectl "${KCTX[@]}" cp "$TMP/$r" "$NS/$POD:$WORKDIR/$name/$r" -c "$CON" >/dev/null 2>&1; then
+                printf '  shipped  %s\n' "$r"
+              else
+                echo "  FAILED   $r" >&2
+              fi
+            done
+            kex "chmod 600 \$(find '$WORKDIR/$name' -name '.env*' -not -name '*.example' 2>/dev/null) 2>/dev/null; true" >/dev/null
+            echo "done" ;;
+
+        status|*)
+            echo "vault: $VAULT"
+            echo "repo:  $name"
+            echo "-- on disk here --"
+            env_files "$root" | sed 's/^/  /' || true
+            echo "-- in the vault --"
+            if [ -d "$VAULT/$name" ]; then
+              ( cd "$VAULT/$name" && find . -type f | sed 's#^\./#  #' )
+            else echo "  (nothing)"; fi
+            echo "-- in the workspace --"
+            kex "cd '$WORKDIR/$name' 2>/dev/null && find . -name '.env*' -not -name '*.example' -not -path '*/node_modules/*' 2>/dev/null | sed 's#^\./#  #' || echo '  (not cloned)'" ;;
+      esac ;;
   wt)
       p=$(cur_project) || { echo "agent wt: not in a git repo" >&2; exit 1; }
       sel=$(kex "ls -1 $WORKDIR/$p/.claude/worktrees 2>/dev/null" | tr -d '\r' | sed '/^$/d' | pick "worktree")
