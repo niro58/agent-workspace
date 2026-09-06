@@ -16,14 +16,15 @@
 #   agent wt            open a session in an existing server-side worktree
 #   agent fix [name]    repair a corrupted / wrong-sized UI
 #   agent handoff       move this checkout's Claude conversation to the server
+#   agent fetch         bring a conversation back from the server to here
 #   agent scratch       a plain t1/t2 scratch session
 #   agent killall       kill every session of this project
 #   agent <name>        attach by exact name
 #   agent kill <name>   delete a session
 #   agent gh-login      log the workspace into GitHub (one time)
 #   agent shell         plain bash, no zellij
-#   agent sync          push local config changes, pull them into the pod
-#   agent env <cmd>     encrypted project secrets: push | pull | ship | status
+#   agent sync          two-way config sync between here and the workspace
+#   agent env <cmd>     secrets: push | pull | ship | pull-remote | status
 set -uo pipefail
 # ---- configuration -------------------------------------------------------
 # Override any of these in ~/.config/agent-workspace/config, or via the
@@ -347,6 +348,41 @@ EOF
             kex "chmod 600 \$(find '$WORKDIR/$name' -name '.env*' -not -name '*.example' 2>/dev/null) 2>/dev/null; true" >/dev/null
             echo "done" ;;
 
+        pull-remote|back)
+            # Bring .env files edited on the SERVER back into the vault.
+            # Decrypted files never leave the pod unencrypted beyond this
+            # machine: they are fetched, re-encrypted here, then discarded.
+            [ -d "$VAULT/$name" ] || { echo "vault has nothing for $name yet — run 'agent env push' first" >&2; exit 1; }
+            kex "test -d '$WORKDIR/$name'" >/dev/null 2>&1 \
+              || { echo "agent env: $name is not cloned in the workspace" >&2; exit 1; }
+            TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+            changed=0
+            ( cd "$VAULT/$name" && find . -type f ! -name '*.md' | sed 's#^\./##' ) | while read -r r; do
+              mkdir -p "$TMP/$(dirname "$r")"
+              kex "cat '$WORKDIR/$name/$r' 2>/dev/null" > "$TMP/$r" 2>/dev/null
+              [ -s "$TMP/$r" ] || { printf '  missing on server  %s\n' "$r"; continue; }
+              # compare against what the vault currently decrypts to
+              if sops --config "$VAULT/.sops.yaml" --decrypt --input-type dotenv --output-type dotenv \
+                   "$VAULT/$name/$r" 2>/dev/null | diff -q - "$TMP/$r" >/dev/null 2>&1; then
+                printf '  unchanged  %s\n' "$r"
+              else
+                if sops --config "$VAULT/.sops.yaml" --encrypt --input-type dotenv --output-type dotenv \
+                     "$TMP/$r" > "$VAULT/$name/$r" 2>"$errf"; then
+                  printf '  UPDATED    %s\n' "$r"
+                else
+                  printf '  FAILED     %s — %s\n' "$r" "$(head -1 "$errf")" >&2
+                fi
+              fi
+            done
+            if [ -n "$(git -C "$VAULT" status --porcelain)" ]; then
+              git -C "$VAULT" add -A
+              git -C "$VAULT" commit -q -m "$name: env changes from the workspace"
+              git -C "$VAULT" push -q origin HEAD 2>/dev/null && echo "vault updated"
+              echo "run 'agent env pull' to bring them onto this machine too"
+            else
+              echo "vault already matches the server"
+            fi ;;
+
         status|*)
             echo "vault: $VAULT"
             echo "repo:  $name"
@@ -357,27 +393,80 @@ EOF
               ( cd "$VAULT/$name" && find . -type f | sed 's#^\./#  #' )
             else echo "  (nothing)"; fi
             echo "-- in the workspace --"
-            kex "cd '$WORKDIR/$name' 2>/dev/null && find . -name '.env*' -not -name '*.example' -not -path '*/node_modules/*' 2>/dev/null | sed 's#^\./#  #' || echo '  (not cloned)'" ;;
+            kex "cd '$WORKDIR/$name' 2>/dev/null && find . -name '.env*' -not -name '*.example' -not -path '*/node_modules/*' -not -path '*/worktrees/*' -not -path '*/.claude/*' 2>/dev/null | sed 's#^\./#  #' || echo '  (not cloned)'" ;;
       esac ;;
+  fetch)
+      # The reverse of `agent handoff`: bring a conversation you had on the
+      # SERVER onto this machine, resumed. Same path rewriting, mirrored.
+      top=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "agent fetch: run this inside a git repo" >&2; exit 1; }
+      root=$(repo_root); name=$(sanitize "$(basename "$root")")
+      REMOTE_CWD="$WORKDIR/$name"
+      REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
+      LOCAL_DIR="$HOME/.claude/projects/$(printf '%s' "$top" | tr '/.' '--')"
+
+      sel=${2:-}
+      if [ -z "$sel" ]; then
+        rows=$(kex "ls -t '$REMOTE_DIR'/*.jsonl 2>/dev/null | head -20 | while read -r f; do
+                      printf '%-38s %6s  %s\n' \"\$(basename \"\$f\" .jsonl)\" \
+                        \"\$(du -h \"\$f\" | cut -f1)\" \"\$(date -r \"\$f\" '+%Y-%m-%d %H:%M')\"
+                    done" | tr -d '\r' | sed '/^$/d')
+        [ -n "$rows" ] || { echo "no conversations recorded on the server for $name" >&2; exit 1; }
+        sel=$(printf '%s\n' "$rows" | pick "conversation" | awk '{print $1}')
+        [ -n "${sel:-}" ] || exit 0
+      fi
+
+      mkdir -p "$LOCAL_DIR"
+      TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+      echo "fetching $sel ..."
+      kubectl "${KCTX[@]}" cp "$NS/$POD:$REMOTE_DIR/$sel.jsonl" "$TMP/$sel.jsonl" -c "$CON" >/dev/null 2>&1 \
+        || { echo "agent fetch: copy failed" >&2; exit 1; }
+      [ -s "$TMP/$sel.jsonl" ] || { echo "agent fetch: empty transcript" >&2; exit 1; }
+
+      esc_r=$(printf '%s' "$REMOTE_CWD" | sed 's#/#\\\\/#g')
+      esc_l=$(printf '%s' "$top"        | sed 's#/#\\\\/#g')
+      sed -e "s#$REMOTE_CWD#$top#g" -e "s#$esc_r#$esc_l#g" \
+          "$TMP/$sel.jsonl" > "$LOCAL_DIR/$sel.jsonl"
+      echo "rewrote  $REMOTE_CWD -> $top"
+      echo "resuming here — then just type: continue"
+      cd "$top" && exec claude --resume "$sel" ;;
+
   wt)
       p=$(cur_project) || { echo "agent wt: not in a git repo" >&2; exit 1; }
       sel=$(kex "ls -1 $WORKDIR/$p/.claude/worktrees 2>/dev/null" | tr -d '\r' | sed '/^$/d' | pick "worktree")
       [ -n "${sel:-}" ] || { echo "no server-side worktrees under $WORKDIR/$p"; exit 0; }
       kati "cd "$WORKDIR"/$p/.claude/worktrees/$sel && zellij attach -c '$p@$sel'" ;;
   sync)
-      # NOTE: this pushes the dotfiles repo's own default branch. That is the
-      # intended flow for a personal config repo, and is unrelated to the
-      # never-push-to-main rule that applies to code repos.
-      echo "--- local: commit + push config ---"
-      chezmoi re-add >/dev/null 2>&1 || true
+      # Two-way config sync. The pod is checked FIRST: a naive `chezmoi update
+      # --force` there would silently discard edits made on the server.
+      #
+      # File modes are ignored on the pod side — the PVC's fsGroup gives every
+      # file a group-write bit the desktop does not have, which would otherwise
+      # produce a commit of hundreds of meaningless 100664->100644 changes.
       SRC=$(chezmoi source-path)
+      echo "--- pod: any config changes to bring back? ---"
+      kex 'S=$(chezmoi source-path)
+           git -C "$S" config core.fileMode false
+           chezmoi re-add >/dev/null 2>&1 || true
+           if [ -n "$(git -C "$S" status --porcelain)" ]; then
+             git -C "$S" add -A
+             git -C "$S" commit -q -m "config: from workspace $(date -u +%F)"
+             git -C "$S" push -q origin HEAD 2>/dev/null && echo "  pushed from the pod"
+           else echo "  nothing changed on the server"; fi'
+
+      echo "--- local: pull those, then commit anything of mine ---"
+      git -C "$SRC" pull -q --ff-only 2>/dev/null || echo "  (pull skipped — diverged; resolve in $SRC)"
+      chezmoi re-add >/dev/null 2>&1 || true
       if [ -n "$(git -C "$SRC" status --porcelain)" ]; then
         git -C "$SRC" add -A
         git -C "$SRC" commit -q -m "config: sync from $(hostname) $(date -u +%F)"
-        git -C "$SRC" push -q origin HEAD && echo "pushed"
-      else echo "nothing to push"; fi
-      echo "--- pod: pull + apply ---"
-      kex 'chezmoi update --force 2>&1 | tail -3; echo applied' ;;
+        git -C "$SRC" push -q origin HEAD && echo "  pushed from $(hostname)"
+      else echo "  nothing changed here"; fi
+
+      echo "--- apply everywhere ---"
+      chezmoi apply 2>&1 | tail -3
+      echo "  applied locally"
+      kex 'chezmoi update --force 2>&1 | tail -2; echo "  applied on the server"' ;;
   resume|r)
       rows=$(inv)
       [ -n "$rows" ] || { echo "no sessions — starting one"; n=$(next_free); kati "cd "$WORKDIR" && zellij attach -c $n"; }
