@@ -97,10 +97,11 @@ Subsequent restarts are seconds, because everything persists.
 | `agent ls` | Everything running |
 | `agent wt` | Open a session in a server-side git worktree |
 | `agent handoff` | Move this checkout's Claude conversation to the server, resumed |
+| `agent fetch` | Bring a conversation back from the server to this machine |
 | `agent fix` | Repair a corrupted or wrong-sized terminal |
 | `agent killall` | Kill every session for this project |
-| `agent env <cmd>` | Encrypted project secrets — `push` / `pull` / `ship` / `status` |
-| `agent sync` | Push local config changes and apply them in the pod |
+| `agent env <cmd>` | Encrypted project secrets — `push` / `pull` / `ship` / `pull-remote` / `status` |
+| `agent sync` | Two-way config sync between this machine and the workspace |
 | `agent shell` | Plain bash, no multiplexer |
 
 Sessions are named `repo`, `repo@2`, `repo@label`. Bare `agent` never mirrors: it
@@ -120,6 +121,10 @@ mirrored, so the size of your local projects directory is irrelevant.
 **Worktrees — recreated, never synced.** A worktree is derived state, fully
 reconstructible from `git worktree add`. Branches travel between machines; directories
 don't. This is what makes a worktree-heavy agent workflow viable at all.
+
+**Config — genuinely two-way, via chezmoi.** `agent sync` checks the *pod first* and
+commits anything changed there before applying local changes. A one-way sync would
+silently discard config you edited on the server.
 
 **Config — bidirectional, via chezmoi.** Your agent instructions, subagents, skills and
 hooks live in a git repo applied on both machines. Credentials are excluded — you log in
