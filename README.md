@@ -99,6 +99,7 @@ Subsequent restarts are seconds, because everything persists.
 | `agent handoff` | Move this checkout's Claude conversation to the server, resumed |
 | `agent fix` | Repair a corrupted or wrong-sized terminal |
 | `agent killall` | Kill every session for this project |
+| `agent env <cmd>` | Encrypted project secrets — `push` / `pull` / `ship` / `status` |
 | `agent sync` | Push local config changes and apply them in the pod |
 | `agent shell` | Plain bash, no multiplexer |
 
@@ -127,6 +128,12 @@ localhost, desktop-only skills) are templated on a `profile` variable, so one re
 both.
 
 See [docs/syncing.md](docs/syncing.md) for the chezmoi layout.
+
+**Project secrets — a separate encrypted vault.** Your `.env` files are gitignored, so a
+clean clone on the server can't actually run anything. `agent env` keeps them in a
+private sops+age vault, one directory per project, and ships decrypted copies into the
+workspace. The age key stays on your machine and never enters the pod.
+See [docs/secrets.md](docs/secrets.md).
 
 **Sessions — single-homed on purpose.** They exist only on the server.
 
