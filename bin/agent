@@ -16,6 +16,8 @@
 #   agent wt            open a session in an existing server-side worktree
 #   agent fix [name]    repair a corrupted / wrong-sized UI
 #   agent handoff       move this checkout's Claude conversation to the server
+#   agent handoff-all   pick from EVERY conversation on this machine, move them
+#   agent open          attach to a transferred conversation (one per terminal)
 #   agent fetch         bring a conversation back from the server to here
 #   agent scratch       a plain t1/t2 scratch session
 #   agent killall       kill every session of this project
@@ -123,6 +125,97 @@ gh_login() {
   echo "Logging the workspace into GitHub (device flow — follow the prompts):"
   kubectl "${KCTX[@]}" exec -it -n "$NS" "$POD" -c "$CON" -- \
     bash -lc 'gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && gh auth status'
+}
+
+# Rewrite absolute paths inside a transcript, most specific first so a nested
+# path is not half-rewritten by a broader rule. Handles both the bare form and
+# the JSON-escaped \/ form some encoders emit.
+# usage: rewrite_paths <infile> <outfile> <from1> <to1> [<from2> <to2> ...]
+rewrite_paths() {
+  local in=$1 out=$2; shift 2
+  local args=() f t
+  while [ $# -ge 2 ]; do
+    f=$1; t=$2; shift 2
+    [ -n "$f" ] && [ -n "$t" ] && [ "$f" != "$t" ] || continue
+    args+=(-e "s#$f#$t#g")
+    args+=(-e "s#$(printf '%s' "$f" | sed 's#/#\\\\/#g')#$(printf '%s' "$t" | sed 's#/#\\\\/#g')#g")
+  done
+  sed "${args[@]}" "$in" > "$out"
+}
+
+# Move one conversation to the workspace: rewrite its paths, stream it over,
+# reconstruct the worktree if the branch is reachable, and register it so
+# `agent open` can find it later. Sets XFER_SESSION to the session name.
+# usage: xfer_one <session-id> <local-cwd>
+XFER_SESSION=
+xfer_one() {
+  local sel=$1 top=$2
+  local root name wt base_name REMOTE_CWD REMOTE_DIR LOCAL_DIR SRC branch TMP sz
+
+  root=$(git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  root=$(dirname "$root")
+  name=$(sanitize "$(basename "$root")")
+  wt=; [ "$top" = "$root" ] || wt=$(sanitize "$(basename "$top")")
+  base_name="$name"; [ -n "$wt" ] && base_name="$name@$wt"
+  branch=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  LOCAL_DIR="$HOME/.claude/projects/$(printf '%s' "$top" | tr '/.' '--')"
+  SRC="$LOCAL_DIR/$sel.jsonl"
+  [ -f "$SRC" ] || { echo "  transcript not found for $sel" >&2; return 1; }
+
+  REMOTE_CWD="$WORKDIR/$name"
+  [ -n "$wt" ] && REMOTE_CWD="$WORKDIR/$name/.claude/worktrees/$wt"
+  REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
+  sz=$(du -h "$SRC" | cut -f1)
+
+  # the repo itself must exist on the server before a worktree can hang off it
+  if ! kex "test -d '$WORKDIR/$name/.git'" >/dev/null 2>&1; then
+    local slug; slug=$(slug_of "$(git -C "$top" remote get-url origin 2>/dev/null)")
+    [ -n "$slug" ] || { echo "  no origin remote; skipping" >&2; return 1; }
+    echo "  cloning $slug ..."
+    kex "mkdir -p '$WORKDIR' && gh repo clone $slug '$WORKDIR/$name' -- -q" >/dev/null 2>&1 \
+      || { echo "  clone failed" >&2; return 1; }
+  fi
+
+  TMP=$(mktemp -d)
+  rewrite_paths "$SRC" "$TMP/$sel.jsonl" \
+    "$top" "$REMOTE_CWD" \
+    "$root" "$WORKDIR/$name" \
+    "$HOME" "$REMOTE_HOME"
+
+  kex "mkdir -p '$REMOTE_DIR' ~/.config/zellij/layouts" >/dev/null
+  echo "  copying $sz ..."
+  if ! gzip -c "$TMP/$sel.jsonl" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- \
+        bash -lc "gunzip > '$REMOTE_DIR/$sel.jsonl'"; then
+    echo "  copy failed" >&2; rm -rf "$TMP"; return 1
+  fi
+  rm -rf "$TMP"
+
+  # reconstruct the worktree, or say plainly why the tree will be empty
+  if [ -n "$wt" ] && ! kex "test -e '$REMOTE_CWD/.git'" >/dev/null 2>&1; then
+    if git -C "$top" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+      echo "  building worktree from origin/$branch"
+      kex "cd '$WORKDIR/$name' && git fetch -q origin '$branch' && \
+           git worktree add -f '$REMOTE_CWD' '$branch'" >/dev/null 2>&1 \
+        || echo "  worktree add failed — tree will be empty" >&2
+    else
+      echo "  note: '$branch' is not on origin, so the working tree will be empty"
+    fi
+  fi
+  kex "mkdir -p '$REMOTE_CWD'" >/dev/null
+
+  kex "printf 'layout {\n    pane command=\"%s\" cwd=\"%s\" {\n        args \"--resume\" \"%s\"\n    }\n}\n' \
+         \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
+         > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
+
+  XFER_SESSION=$(uniq_name "$base_name")
+  # register it so `agent open` can list it (one line per session, deduped)
+  kex "touch ~/.claude/handoff-index.tsv
+       grep -v \"^$XFER_SESSION\$(printf '\t')\" ~/.claude/handoff-index.tsv > /tmp/hi.\$\$ 2>/dev/null || true
+       printf '%s\t%s\t%s\n' '$XFER_SESSION' '$sel' '$REMOTE_CWD' >> /tmp/hi.\$\$
+       mv /tmp/hi.\$\$ ~/.claude/handoff-index.tsv" >/dev/null
+  echo "  ready as: $XFER_SESSION"
+  return 0
 }
 
 project_session() {
@@ -237,7 +330,9 @@ case "${1:-auto}" in
         read -r a; case "$a" in y|Y) ;; *) echo "aborted"; exit 0 ;; esac
       fi
 
+      base_name="$name"; [ -n "$wt" ] && base_name="$name@$wt"
       REMOTE_CWD="$WORKDIR/$name"
+      [ -n "$wt" ] && REMOTE_CWD="$WORKDIR/$name/.claude/worktrees/$wt"
       REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
       TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
       # rewrite embedded paths: bare form, then the JSON-escaped \/ form
@@ -248,8 +343,8 @@ case "${1:-auto}" in
 
       kex "mkdir -p '$REMOTE_DIR' '$REMOTE_CWD' ~/.config/zellij/layouts" >/dev/null
       echo "copying ..."
-      kubectl "${KCTX[@]}" cp "$TMP/$sel.jsonl" \
-        "$NS/$POD:$REMOTE_DIR/$sel.jsonl" -c "$CON" >/dev/null 2>&1 \
+      gzip -c "$TMP/$sel.jsonl" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- \
+        bash -lc "gunzip > '$REMOTE_DIR/$sel.jsonl'" \
         || { echo "agent handoff: copy failed" >&2; exit 1; }
       kex "ls -lh '$REMOTE_DIR/$sel.jsonl' | awk '{print \"  copied \" \$5}'"
 
@@ -258,9 +353,26 @@ case "${1:-auto}" in
              \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
              > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
 
-      s=$(uniq_name "$name")
+      # If we came from a worktree, make sure a REAL one exists on the server;
+      # otherwise the conversation resumes in an empty directory. This needs the
+      # branch to be reachable from the remote, so say so plainly when it is not.
+      if [ -n "$wt" ]; then
+        if ! kex "test -e '$REMOTE_CWD/.git'" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "creating worktree '$wt' on the server from origin/$branch ..."
+            kex "cd '$WORKDIR/$name' && git fetch -q origin '$branch' 2>/dev/null && \
+                 git worktree add -f '$REMOTE_CWD' '$branch' 2>&1 | tail -2" | sed 's/^/  /'
+          else
+            echo "  note: branch '$branch' is not on origin, so the server has no code for it."
+            echo "        the conversation will resume, but the working tree will be empty."
+            echo "        push the branch first if you want the files there too."
+          fi
+        fi
+      fi
+
+      s=$(uniq_name "$base_name")
       echo "opening '$s' with the conversation resumed — then just type: continue"
-      kati "cd '$REMOTE_CWD'; zellij --session '$s' --layout resume-$sel" ;;
+      kati "cd '$REMOTE_CWD' 2>/dev/null || cd '$WORKDIR/$name'; zellij --session '$s' -n resume-$sel" ;;
   env)
       # Encrypted project secrets. The age private key lives ONLY on this machine
       # (~/.config/sops/age/keys.txt); the workspace receives decrypted files, so a
@@ -401,7 +513,10 @@ EOF
       top=$(git rev-parse --show-toplevel 2>/dev/null) || {
         echo "agent fetch: run this inside a git repo" >&2; exit 1; }
       root=$(repo_root); name=$(sanitize "$(basename "$root")")
+      # a conversation held in a worktree lives under that worktree's own path
+      wt=; [ "$top" = "$root" ] || wt=$(sanitize "$(basename "$top")")
       REMOTE_CWD="$WORKDIR/$name"
+      [ -n "$wt" ] && REMOTE_CWD="$WORKDIR/$name/.claude/worktrees/$wt"
       REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
       LOCAL_DIR="$HOME/.claude/projects/$(printf '%s' "$top" | tr '/.' '--')"
 
@@ -419,7 +534,8 @@ EOF
       mkdir -p "$LOCAL_DIR"
       TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
       echo "fetching $sel ..."
-      kubectl "${KCTX[@]}" cp "$NS/$POD:$REMOTE_DIR/$sel.jsonl" "$TMP/$sel.jsonl" -c "$CON" >/dev/null 2>&1 \
+      kubectl "${KCTX[@]}" exec -n "$NS" "$POD" -c "$CON" -- \
+        gzip -c "$REMOTE_DIR/$sel.jsonl" 2>/dev/null | gunzip > "$TMP/$sel.jsonl" \
         || { echo "agent fetch: copy failed" >&2; exit 1; }
       [ -s "$TMP/$sel.jsonl" ] || { echo "agent fetch: empty transcript" >&2; exit 1; }
 
@@ -430,6 +546,81 @@ EOF
       echo "rewrote  $REMOTE_CWD -> $top"
       echo "resuming here — then just type: continue"
       cd "$top" && exec claude --resume "$sel" ;;
+
+  handoff-all|migrate)
+      # Multi-select over EVERY Claude conversation on this machine, then move the
+      # chosen ones to the workspace. Nothing is opened: each lands ready, and
+      # `agent open` attaches one per terminal afterwards.
+      #
+      # A conversation's home directory MOVES when its cwd changes mid-session, so
+      # the index is built from each transcript's LAST recorded cwd, not from the
+      # directory name (which would be both ambiguous and stale).
+      echo "indexing conversations ..." >&2
+      IDX=$(mktemp); trap 'rm -f "$IDX"' EXIT
+      for d in "$HOME"/.claude/projects/*/; do
+        for f in "$d"*.jsonl; do
+          [ -f "$f" ] || continue
+          cwd=$(tail -80 "$f" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null | tail -1)
+          [ -n "$cwd" ] || cwd=$(head -80 "$f" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null | head -1)
+          [ -n "$cwd" ] && [ -d "$cwd" ] || continue
+          git -C "$cwd" rev-parse --show-toplevel >/dev/null 2>&1 || continue
+          printf '%s\t%s\t%s\t%s\n' "$(stat -c %Y "$f")" "$(basename "$f" .jsonl)" "$cwd" "$(stat -c %s "$f")"
+        done
+      done | sort -rn > "$IDX"
+      n=$(wc -l < "$IDX")
+      [ "$n" -gt 0 ] || { echo "no conversations found" >&2; exit 1; }
+      echo "  $n conversations across $(cut -f3 "$IDX" | sort -u | wc -l) checkouts" >&2
+
+      rows=$(while IFS=$'\t' read -r mt id cwd sz; do
+               printf '%-38s %7s  %s  %s\n' "$id" "$(numfmt --to=iec "$sz")" \
+                 "$(date -d "@$mt" '+%m-%d %H:%M')" "${cwd#$HOME/projects/}"
+             done < "$IDX")
+      if command -v fzf >/dev/null 2>&1; then
+        picked=$(printf '%s\n' "$rows" | fzf --multi --reverse --height=80% --no-sort \
+                   --prompt='select conversations (TAB to mark, ENTER to confirm) > ' \
+                   --header='newest first · size · last used · checkout')
+      else
+        printf '%s\n' "$rows" | nl -w3 -s') ' >&2
+        read -rp "numbers (space separated): " nums
+        picked=$(for i in $nums; do printf '%s\n' "$rows" | sed -n "${i}p"; done)
+      fi
+      [ -n "${picked:-}" ] || { echo "nothing selected"; exit 0; }
+
+      echo
+      total=$(printf '%s\n' "$picked" | grep -c .)
+      echo "transferring $total conversation(s)"
+      i=0; OPENED=$(mktemp)
+      printf '%s\n' "$picked" | while read -r line; do
+        id=$(printf '%s' "$line" | awk '{print $1}')
+        cwd=$(grep -P "^\d+\t$id\t" "$IDX" | cut -f3)
+        [ -n "$cwd" ] || continue
+        i=$((i+1))
+        echo
+        echo "[$i/$total] $id"
+        xfer_one "$id" "$cwd" && printf '%s\n' "$XFER_SESSION" >> "$OPENED"
+      done
+      echo
+      echo "done. open them one per terminal with:"
+      echo "  agent open          # pick from a list"
+      rm -f "$OPENED" ;;
+
+  open)
+      # Attach to a transferred conversation, creating its session on first use.
+      rows=$(kex "cat ~/.claude/handoff-index.tsv 2>/dev/null" | tr -d '\r' | sed '/^$/d')
+      [ -n "$rows" ] || { echo "nothing has been handed off yet — run 'agent handoff' or 'agent handoff-all'" >&2; exit 1; }
+      live=$(names)
+      disp=$(printf '%s\n' "$rows" | while IFS=$'\t' read -r nm id cwd; do
+               st=open; printf '%s\n' "$live" | grep -qxF "$nm" || st=new
+               printf '%-34s %-5s %s\n' "$nm" "$st" "${cwd#*/work/}"
+             done)
+      sel=$(printf '%s\n' "$disp" | pick "open" | awk '{print $1}')
+      [ -n "${sel:-}" ] || exit 0
+      rid=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$sel" '$1==n{print $2; exit}')
+      if printf '%s\n' "$live" | grep -qxF "$sel"; then
+        kati "zellij attach '$sel'"
+      else
+        kati "zellij --session '$sel' -n resume-$rid"
+      fi ;;
 
   wt)
       p=$(cur_project) || { echo "agent wt: not in a git repo" >&2; exit 1; }
