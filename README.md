@@ -97,6 +97,10 @@ Subsequent restarts are seconds, because everything persists.
 | `agent ls` | Everything running |
 | `agent wt` | Open a session in a server-side git worktree |
 | `agent handoff` | Move this checkout's Claude conversation to the server, resumed |
+| `agent handoff-all` | Pick from every conversation on this machine and move them |
+| `agent open` | Attach to a transferred conversation — one per terminal |
+| `agent mcp <cmd>` | MCP servers — `status` / `sync` / `auth` |
+| `agent --help` | Every command, plus the resolved config |
 | `agent fetch` | Bring a conversation back from the server to this machine |
 | `agent fix` | Repair a corrupted or wrong-sized terminal |
 | `agent killall` | Kill every session for this project |
@@ -108,6 +112,19 @@ Sessions are named `repo`, `repo@2`, `repo@label`. Bare `agent` never mirrors: i
 reuses a session nobody is attached to, and only creates a new one when they're all
 busy. That single rule covers both "give me my session back" and "give me another
 terminal", which otherwise collide.
+
+## Slash commands
+
+`commands/` holds two Claude Code commands. Copy them to `~/.claude/commands/`:
+
+| | |
+|---|---|
+| `/agent-handoff` | Moves **the conversation you are in** to the workspace |
+| `/agent-open` | Shows what is waiting there and how to attach |
+
+`/agent-handoff` works because Claude Code sets `CLAUDE_CODE_SESSION_ID` in the
+environment, so `agent handoff --current` transfers the running conversation with no
+picker — which matters, since a slash command has no terminal to drive one with.
 
 ## How the syncing works
 

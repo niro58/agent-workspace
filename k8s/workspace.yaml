@@ -1,4 +1,91 @@
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-workspace
+  namespace: agent
+---
+# Full control of its own namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-workspace
+  namespace: agent
+rules:
+  - apiGroups: ["", "apps", "batch"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-workspace
+  namespace: agent
+subjects:
+  - kind: ServiceAccount
+    name: agent-workspace
+    namespace: agent
+roleRef:
+  kind: Role
+  name: agent-workspace
+  apiGroup: rbac.authorization.k8s.io
+---
+# pen-kube drives a pod in the design namespace with `kubectl exec` and `cp`.
+# Exactly those verbs, nothing that can delete or mutate a workload.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-workspace-pen
+  namespace: design
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-workspace-pen
+  namespace: design
+subjects:
+  - kind: ServiceAccount
+    name: agent-workspace
+    namespace: agent
+roleRef:
+  kind: Role
+  name: agent-workspace-pen
+  apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-wide READ so an agent can see what is running without being able to
+# change anything outside the two namespaces above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-workspace-read
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-workspace-read
+subjects:
+  - kind: ServiceAccount
+    name: agent-workspace
+    namespace: agent
+roleRef:
+  kind: ClusterRole
+  name: agent-workspace-read
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: agent-docker
@@ -85,6 +172,20 @@ data:
         "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64" \
         && chmod +x "$HOME/.docker/cli-plugins/docker-compose"; }
 
+    # ---- in-cluster kubeconfig for the workspace ServiceAccount.
+    #      tokenFile (not a baked token) so projected-token rotation is handled.
+    #      Written with printf, not a heredoc: a heredoc body would sit at column
+    #      zero and break out of this YAML block scalar.
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    if [ -r "$SA/token" ] && [ ! -f "$HOME/.kube/config" ]; then
+      echo ">> kubeconfig (in-cluster ServiceAccount)"
+      mkdir -p "$HOME/.kube"
+      NSNAME=$(cat "$SA/namespace" 2>/dev/null || echo agent)
+      printf 'apiVersion: v1\nkind: Config\nclusters:\n  - name: in-cluster\n    cluster:\n      server: https://kubernetes.default.svc\n      certificate-authority: %s/ca.crt\nusers:\n  - name: workspace-sa\n    user:\n      tokenFile: %s/token\ncontexts:\n  - name: in-cluster\n    context:\n      cluster: in-cluster\n      user: workspace-sa\n      namespace: %s\ncurrent-context: in-cluster\n' \
+        "$SA" "$SA" "$NSNAME" > "$HOME/.kube/config"
+      chmod 600 "$HOME/.kube/config"
+    fi
+
     echo
     echo "=== result ==="
     for b in node npm pnpm git zellij claude codex rtk jq rg fd fzf gh kubectl chezmoi mise docker; do
@@ -150,6 +251,7 @@ spec:
     metadata:
       labels: { app: workspace }
     spec:
+      serviceAccountName: agent-workspace
       securityContext:
         fsGroup: 1000
       initContainers:

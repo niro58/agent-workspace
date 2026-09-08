@@ -16,6 +16,9 @@
 #   agent wt            open a session in an existing server-side worktree
 #   agent fix [name]    repair a corrupted / wrong-sized UI
 #   agent handoff       move this checkout's Claude conversation to the server
+#                       (--current uses the session you are in, no picker)
+#   agent handoff-all   pick from EVERY conversation on this machine, move them
+#   agent open          attach to a transferred conversation (one per terminal)
 #   agent fetch         bring a conversation back from the server to here
 #   agent scratch       a plain t1/t2 scratch session
 #   agent killall       kill every session of this project
@@ -24,6 +27,7 @@
 #   agent gh-login      log the workspace into GitHub (one time)
 #   agent shell         plain bash, no zellij
 #   agent sync          two-way config sync between here and the workspace
+#   agent mcp <cmd>     MCP servers: status | sync | auth
 #   agent env <cmd>     secrets: push | pull | ship | pull-remote | status
 set -uo pipefail
 # ---- configuration -------------------------------------------------------
@@ -125,6 +129,183 @@ gh_login() {
     bash -lc 'gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git && gh auth status'
 }
 
+# Rewrite absolute paths inside a transcript, most specific first so a nested
+# path is not half-rewritten by a broader rule. Handles both the bare form and
+# the JSON-escaped \/ form some encoders emit.
+# usage: rewrite_paths <infile> <outfile> <from1> <to1> [<from2> <to2> ...]
+rewrite_paths() {
+  local in=$1 out=$2; shift 2
+  local args=() f t
+  while [ $# -ge 2 ]; do
+    f=$1; t=$2; shift 2
+    [ -n "$f" ] && [ -n "$t" ] && [ "$f" != "$t" ] || continue
+    args+=(-e "s#$f#$t#g")
+    args+=(-e "s#$(printf '%s' "$f" | sed 's#/#\\\\/#g')#$(printf '%s' "$t" | sed 's#/#\\\\/#g')#g")
+  done
+  sed "${args[@]}" "$in" > "$out"
+}
+
+# Move one conversation to the workspace: rewrite its paths, stream it over,
+# reconstruct the worktree if the branch is reachable, and register it so
+# `agent open` can find it later. Sets XFER_SESSION to the session name.
+# usage: xfer_one <session-id> <local-cwd>
+XFER_SESSION=
+xfer_one() {
+  local sel=$1 top=$2
+  local root name wt base_name REMOTE_CWD REMOTE_DIR LOCAL_DIR SRC branch TMP sz wtroot sub
+
+  root=$(git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  root=$(dirname "$root")
+  name=$(sanitize "$(basename "$root")")
+  # cwd may sit BELOW the checkout root (e.g. a monorepo package inside a
+  # worktree). Resolve the checkout root for naming, and keep the offset so the
+  # session reopens in the same subdirectory it was left in.
+  local wtroot sub
+  wtroot=$(git -C "$top" rev-parse --show-toplevel 2>/dev/null) || wtroot=$top
+  sub=${top#"$wtroot"}; sub=${sub#/}
+  wt=; [ "$wtroot" = "$root" ] || wt=$(sanitize "$(basename "$wtroot")")
+  base_name="$name"; [ -n "$wt" ] && base_name="$name@$wt"
+  branch=$(git -C "$top" rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+  # A transcript is re-homed when the session's cwd changes, so its directory
+  # name does not reliably follow the cwd. Locate the file by id instead.
+  LOCAL_DIR="$HOME/.claude/projects/$(printf '%s' "$top" | tr '/.' '--')"
+  SRC="$LOCAL_DIR/$sel.jsonl"
+  if [ ! -f "$SRC" ]; then
+    SRC=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sel.jsonl" -type f 2>/dev/null | head -1)
+  fi
+  [ -f "${SRC:-}" ] || { echo "  transcript not found for $sel" >&2; return 1; }
+
+  local REMOTE_ROOT
+  REMOTE_ROOT="$WORKDIR/$name"
+  [ -n "$wt" ] && REMOTE_ROOT="$WORKDIR/$name/.claude/worktrees/$wt"
+  REMOTE_CWD="$REMOTE_ROOT"; [ -n "$sub" ] && REMOTE_CWD="$REMOTE_ROOT/$sub"
+  REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
+  sz=$(du -h "$SRC" | cut -f1)
+
+  # the repo itself must exist on the server before a worktree can hang off it
+  if ! kex "test -d '$WORKDIR/$name/.git'" >/dev/null 2>&1; then
+    local url; url=$(git -C "$top" remote get-url origin 2>/dev/null)
+    [ -n "$url" ] || { echo "  no origin remote; skipping" >&2; return 1; }
+    echo "  cloning $url ..."
+    # gh handles GitHub auth; anything else goes through plain git and needs
+    # credentials the workspace may not have — say so rather than failing blankly.
+    if printf '%s' "$url" | grep -q 'github\.com'; then
+      kex "mkdir -p '$WORKDIR' && gh repo clone $(slug_of "$url") '$WORKDIR/$name' -- -q" >/dev/null 2>&1 \
+        || { echo "  clone failed" >&2; return 1; }
+    else
+      kex "mkdir -p '$WORKDIR' && git clone -q '$url' '$WORKDIR/$name'" >/dev/null 2>&1 \
+        || { echo "  clone failed — the workspace has no credentials for $(printf '%s' "$url" | sed -E 's#.*//([^/]+).*#\1#'); skipping" >&2; return 1; }
+    fi
+  fi
+
+  TMP=$(mktemp -d)
+  rewrite_paths "$SRC" "$TMP/$sel.jsonl" \
+    "$top" "$REMOTE_CWD" \
+    "$root" "$WORKDIR/$name" \
+    "$HOME" "$REMOTE_HOME"
+
+  kex "mkdir -p '$REMOTE_DIR' ~/.config/zellij/layouts" >/dev/null
+  echo "  copying $sz ..."
+  if ! gzip -c "$TMP/$sel.jsonl" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- \
+        bash -lc "gunzip > '$REMOTE_DIR/$sel.jsonl'"; then
+    echo "  copy failed" >&2; rm -rf "$TMP"; return 1
+  fi
+  rm -rf "$TMP"
+
+  # Reconstruct the worktree on the server.
+  #
+  # Preferred path is origin. When the branch is not published there, the commits
+  # travel as a `git bundle` instead — no push required, and typically tiny since
+  # only what is missing from the base branch is packed. Note the remote is probed
+  # with ls-remote, not local remote-tracking refs: those go stale when a branch is
+  # deleted upstream, and git would then believe the commits are already published.
+  if [ -n "$wt" ] && kex "test -e '$REMOTE_ROOT/.git'" >/dev/null 2>&1; then
+    echo "  worktree already present on the server"
+  fi
+  if [ -n "$wt" ] && ! kex "test -e '$REMOTE_ROOT/.git'" >/dev/null 2>&1; then
+    if git -C "$top" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+      echo "  building worktree from origin/$branch"
+      kex "cd '$WORKDIR/$name' && git fetch -q origin '$branch' && \
+           git worktree add -f '$REMOTE_ROOT' '$branch'" >/dev/null 2>&1 \
+        || echo "  worktree add failed — tree will be empty" >&2
+    else
+      # Bundle against a base the SERVER actually has. Using the local
+      # origin/<default> is wrong whenever the two clones fetched at different
+      # times: the bundle then omits commits the server lacks and the fetch
+      # fails with "Repository lacks these prerequisite commits".
+      local base bdl rbase
+      kex "cd '$WORKDIR/$name' && git fetch -q origin" >/dev/null 2>&1
+      rbase=$(kex "cd '$WORKDIR/$name' && git rev-parse origin/HEAD 2>/dev/null || git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null" | tr -d '\r' | head -1)
+      base=""
+      if [ -n "$rbase" ] && git -C "$top" cat-file -e "$rbase" 2>/dev/null; then
+        base="$rbase"                      # server's base, and we have it
+      else
+        git -C "$top" fetch -q origin 2>/dev/null
+        if [ -n "$rbase" ] && git -C "$top" cat-file -e "$rbase" 2>/dev/null; then
+          base="$rbase"
+        fi
+      fi
+      bdl=$(mktemp)
+      if [ -n "$base" ]; then
+        git -C "$top" bundle create "$bdl" "$branch" --not "$base" >/dev/null 2>&1 || : > "$bdl"
+      fi
+      # no shared base (or an empty delta) -> send the branch's full history
+      [ -s "$bdl" ] || git -C "$top" bundle create "$bdl" "$branch" >/dev/null 2>&1
+      if [ -s "$bdl" ]; then
+        echo "  '$branch' is not on origin — sending $(du -h "$bdl" | cut -f1) of commits as a bundle"
+        gzip -c "$bdl" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- \
+          bash -lc "gunzip > /tmp/xfer-$sel.bundle"
+        err=$(kex "cd '$WORKDIR/$name' && \
+                   git fetch /tmp/xfer-$sel.bundle 'refs/heads/$branch:refs/heads/$branch' 2>&1 && \
+                   git worktree add -f '$REMOTE_ROOT' '$branch' 2>&1; \
+                   rm -f /tmp/xfer-$sel.bundle" 2>&1)
+        if kex "test -e '$REMOTE_ROOT/.git'" >/dev/null 2>&1; then
+          echo "  worktree built from the bundle"
+        else
+          echo "  worktree NOT built:" >&2
+          printf '%s\n' "$err" | grep -iE 'error|fatal' | head -3 | sed 's/^/    /' >&2
+        fi
+      else
+        echo "  note: could not bundle '$branch'; tree will be empty" >&2
+      fi
+      rm -f "$bdl"
+    fi
+  fi
+  kex "mkdir -p '$REMOTE_CWD'" >/dev/null
+
+  # Carry uncommitted work: modified and untracked files, excluding anything
+  # gitignored. A bundle only holds commits, so this is the other half.
+  if [ -n "$(git -C "$wtroot" ls-files -mo --exclude-standard 2>/dev/null | head -1)" ]; then
+    local dcount
+    dcount=$(git -C "$wtroot" ls-files -mo --exclude-standard | wc -l)
+    echo "  carrying $dcount uncommitted file(s)"
+    git -C "$wtroot" ls-files -mo --exclude-standard -z 2>/dev/null \
+      | tar -cz --null -T - -C "$wtroot" 2>/dev/null \
+      | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- \
+          bash -lc "mkdir -p '$REMOTE_ROOT' && tar -xz -C '$REMOTE_ROOT'" \
+      || echo "  could not carry uncommitted files" >&2
+  fi
+
+  kex "printf 'layout {\n    pane command=\"%s\" cwd=\"%s\" {\n        args \"--resume\" \"%s\"\n    }\n}\n' \
+         \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
+         > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
+
+  # Re-running a handoff for the same conversation and destination must reuse
+  # its session name. Allocating a fresh one produced repo@name-2 pointing at
+  # the identical transcript and directory.
+  XFER_SESSION=$(kex "awk -F'\t' -v i='$sel' -v c='$REMOTE_CWD' '\$2==i && \$3==c {print \$1; exit}' \
+                        ~/.claude/handoff-index.tsv 2>/dev/null" | tr -d '\r' | head -1)
+  [ -n "${XFER_SESSION:-}" ] || XFER_SESSION=$(uniq_name "$base_name")
+  # register it so `agent open` can list it (one line per session, deduped)
+  kex "touch ~/.claude/handoff-index.tsv
+       grep -v \"^$XFER_SESSION\$(printf '\t')\" ~/.claude/handoff-index.tsv > /tmp/hi.\$\$ 2>/dev/null || true
+       printf '%s\t%s\t%s\n' '$XFER_SESSION' '$sel' '$REMOTE_CWD' >> /tmp/hi.\$\$
+       mv /tmp/hi.\$\$ ~/.claude/handoff-index.tsv" >/dev/null
+  echo "  ready as: $XFER_SESSION"
+  return 0
+}
+
 project_session() {
   local mode=${1:-auto} label=${2:-}
   local top root name slug branch wt= base sess probe state dir
@@ -144,9 +325,9 @@ project_session() {
   case "$state" in
     nologin) echo "The workspace isn't logged into GitHub yet."
              echo "Run:  agent gh-login"; return 2 ;;
-    clone)   echo "cloning $slug into $WORKDIR/$name ..."
-             kex "mkdir -p "$WORKDIR" && gh repo clone $slug $WORKDIR/$name -- -q && \
-                  cd "$WORKDIR"/$name && (git checkout -q '$branch' 2>/dev/null || true)" \
+    clone)   echo "cloning $slug into ~/work/$name ..."
+             kex "mkdir -p ~/work && gh repo clone $slug ~/work/$name -- -q && \
+                  cd ~/work/$name && (git checkout -q '$branch' 2>/dev/null || true)" \
                || { echo "agent: clone failed" >&2; return 2; } ;;
   esac
 
@@ -160,10 +341,16 @@ project_session() {
   esac
 
   printf '%s  (branch %s)\n' "$sess" "${branch:-?}"
-  kati "cd '$dir' 2>/dev/null || cd "$WORKDIR"/$name; zellij attach -c '$sess'"
+  kati "cd '$dir' 2>/dev/null || cd ~/work/$name; zellij attach -c '$sess'"
 }
 
 case "${1:-auto}" in
+  -h|--help|help)
+      sed -n '2,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//; $d'
+      echo "config: ${CONFIG}"
+      echo "  context=${CTX:-<current>}  namespace=$NS  workdir=$WORKDIR"
+      exit 0 ;;
+
   ls|list)   r=$(inv | fmt_rows); [ -n "$r" ] && printf '%s\n' "$r" || echo "no sessions yet" ;;
   kill|rm)   [ -n "${2:-}" ] || { echo "usage: agent kill <name>" >&2; exit 1; }
              kex "zellij delete-session --force '$2'" >/dev/null; echo "killed: $2" ;;
@@ -171,12 +358,12 @@ case "${1:-auto}" in
              for s in $(inv | awk -F'\t' -v p="$p" '$1==p || index($1,p "@")==1 {print $1}'); do
                kex "zellij delete-session --force '$s'" >/dev/null; echo "killed: $s"; done ;;
   gh-login)  gh_login; exit 0 ;;
-  shell|sh)  kati 'cd "$WORKDIR" 2>/dev/null; bash -l' ;;
-  scratch)   n=$(next_free); echo "scratch session: $n"; kati "cd "$WORKDIR" && zellij attach -c $n" ;;
+  shell|sh)  kati 'cd ~/work 2>/dev/null; bash -l' ;;
+  scratch)   n=$(next_free); echo "scratch session: $n"; kati "cd ~/work && zellij attach -c $n" ;;
   -n|new)    project_session new "${2:-}"; rc=$?
              [ $rc -eq 2 ] && exit 1
              n=$(next_free); echo "not in a git repo — scratch session: $n"
-             kati "cd "$WORKDIR" && zellij attach -c $n" ;;
+             kati "cd ~/work && zellij attach -c $n" ;;
   -m|mirror) project_session mirror || { echo "agent -m: not in a git repo" >&2; exit 1; } ;;
   -l|here)   p=$(cur_project) || { echo "agent -l: not in a git repo" >&2; exit 1; }
              r=$(inv | awk -F'\t' -v p="$p" '$1==p || index($1,p "@")==1' | fmt_rows)
@@ -218,6 +405,12 @@ case "${1:-auto}" in
       [ -d "$LOCAL_DIR" ] || { echo "no local conversations recorded for $top" >&2; exit 1; }
 
       sel=${2:-}
+      # `--current` (or CLAUDE_CODE_SESSION_ID when running inside a session)
+      # skips the picker, so this works from a slash command with no TTY.
+      case "$sel" in
+        --current|-c) sel=${CLAUDE_CODE_SESSION_ID:-} 
+                      [ -n "$sel" ] || { echo "agent handoff: not inside a Claude session" >&2; exit 1; } ;;
+      esac
       if [ -z "$sel" ]; then
         rows=$(ls -t "$LOCAL_DIR"/*.jsonl 2>/dev/null | head -20 | while read -r f; do
                  printf '%-38s %6s  %s\n' "$(basename "$f" .jsonl)" \
@@ -228,39 +421,38 @@ case "${1:-auto}" in
         [ -n "${sel:-}" ] || exit 0
       fi
       SRC="$LOCAL_DIR/$sel.jsonl"
-      [ -f "$SRC" ] || { echo "no such conversation: $sel" >&2; exit 1; }
+      if [ ! -f "$SRC" ]; then
+        SRC=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sel.jsonl" -type f 2>/dev/null | head -1)
+      fi
+      [ -f "${SRC:-}" ] || { echo "no such conversation: $sel" >&2; exit 1; }
 
       SZ=$(du -m "$SRC" | cut -f1)
       echo "conversation  $sel  (${SZ} MB)"
-      if [ "$SZ" -gt 60 ]; then
+      if [ "$SZ" -gt 60 ] && [ -t 0 ]; then
         printf 'that is large; the copy may take a while. continue? [y/N] '
         read -r a; case "$a" in y|Y) ;; *) echo "aborted"; exit 0 ;; esac
       fi
 
-      REMOTE_CWD="$WORKDIR/$name"
-      REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
-      TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-      # rewrite embedded paths: bare form, then the JSON-escaped \/ form
-      esc_l=$(printf '%s' "$top"        | sed 's#/#\\\\/#g')
-      esc_r=$(printf '%s' "$REMOTE_CWD" | sed 's#/#\\\\/#g')
-      sed -e "s#$top#$REMOTE_CWD#g" -e "s#$esc_l#$esc_r#g" "$SRC" > "$TMP/$sel.jsonl"
-      echo "rewrote       $top -> $REMOTE_CWD"
+      # One implementation only. This used to be a second, older copy of the
+      # transfer logic, which drifted: it lacked bundle support, did not carry
+      # uncommitted files, never registered the session for `agent open`, and
+      # referenced REMOTE_ROOT — a variable local to xfer_one — so it aborted
+      # under `set -u` the moment a worktree was involved.
+      xfer_one "$sel" "$top" || exit 1
+      [ -n "${XFER_SESSION:-}" ] || { echo "agent handoff: transfer did not complete" >&2; exit 1; }
 
-      kex "mkdir -p '$REMOTE_DIR' '$REMOTE_CWD' ~/.config/zellij/layouts" >/dev/null
-      echo "copying ..."
-      kubectl "${KCTX[@]}" cp "$TMP/$sel.jsonl" \
-        "$NS/$POD:$REMOTE_DIR/$sel.jsonl" -c "$CON" >/dev/null 2>&1 \
-        || { echo "agent handoff: copy failed" >&2; exit 1; }
-      kex "ls -lh '$REMOTE_DIR/$sel.jsonl' | awk '{print \"  copied \" \$5}'"
-
-      # a one-pane layout that boots straight into the resumed conversation
-      kex "printf 'layout {\n    pane command=\"%s\" cwd=\"%s\" {\n        args \"--resume\" \"%s\"\n    }\n}\n' \
-             \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
-             > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
-
-      s=$(uniq_name "$name")
-      echo "opening '$s' with the conversation resumed — then just type: continue"
-      kati "cd '$REMOTE_CWD'; zellij --session '$s' --layout resume-$sel" ;;
+      # Attaching needs a real terminal. From a slash command or a script there
+      # is none, and zellij panics in os_input_output trying to enable raw mode
+      # — after the transfer already succeeded, which reads as a failed handoff.
+      if [ ! -t 1 ] || [ ! -t 0 ]; then
+        echo
+        echo "transfer complete. open it from a terminal with:"
+        echo "  agent open                 # pick from the list"
+        echo "  agent '$XFER_SESSION'      # or go straight to it"
+        exit 0
+      fi
+      echo "opening '$XFER_SESSION' with the conversation resumed — then just type: continue"
+      kati "cd '$WORKDIR/$name' 2>/dev/null || cd '$WORKDIR'; zellij --session '$XFER_SESSION' -n resume-$sel" ;;
   env)
       # Encrypted project secrets. The age private key lives ONLY on this machine
       # (~/.config/sops/age/keys.txt); the workspace receives decrypted files, so a
@@ -401,7 +593,10 @@ EOF
       top=$(git rev-parse --show-toplevel 2>/dev/null) || {
         echo "agent fetch: run this inside a git repo" >&2; exit 1; }
       root=$(repo_root); name=$(sanitize "$(basename "$root")")
+      # a conversation held in a worktree lives under that worktree's own path
+      wt=; [ "$top" = "$root" ] || wt=$(sanitize "$(basename "$top")")
       REMOTE_CWD="$WORKDIR/$name"
+      [ -n "$wt" ] && REMOTE_CWD="$WORKDIR/$name/.claude/worktrees/$wt"
       REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
       LOCAL_DIR="$HOME/.claude/projects/$(printf '%s' "$top" | tr '/.' '--')"
 
@@ -419,23 +614,200 @@ EOF
       mkdir -p "$LOCAL_DIR"
       TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
       echo "fetching $sel ..."
-      kubectl "${KCTX[@]}" cp "$NS/$POD:$REMOTE_DIR/$sel.jsonl" "$TMP/$sel.jsonl" -c "$CON" >/dev/null 2>&1 \
+      kubectl "${KCTX[@]}" exec -n "$NS" "$POD" -c "$CON" -- \
+        gzip -c "$REMOTE_DIR/$sel.jsonl" 2>/dev/null | gunzip > "$TMP/$sel.jsonl" \
         || { echo "agent fetch: copy failed" >&2; exit 1; }
       [ -s "$TMP/$sel.jsonl" ] || { echo "agent fetch: empty transcript" >&2; exit 1; }
 
-      esc_r=$(printf '%s' "$REMOTE_CWD" | sed 's#/#\\\\/#g')
-      esc_l=$(printf '%s' "$top"        | sed 's#/#\\\\/#g')
-      sed -e "s#$REMOTE_CWD#$top#g" -e "s#$esc_r#$esc_l#g" \
-          "$TMP/$sel.jsonl" > "$LOCAL_DIR/$sel.jsonl"
+      rewrite_paths "$TMP/$sel.jsonl" "$LOCAL_DIR/$sel.jsonl" \
+        "$REMOTE_CWD" "$top" \
+        "$WORKDIR/$name" "$root" \
+        "$REMOTE_HOME" "$HOME"
       echo "rewrote  $REMOTE_CWD -> $top"
       echo "resuming here — then just type: continue"
       cd "$top" && exec claude --resume "$sel" ;;
 
+  handoff-all|migrate)
+      # Multi-select over EVERY Claude conversation on this machine, then move the
+      # chosen ones to the workspace. Nothing is opened: each lands ready, and
+      # `agent open` attaches one per terminal afterwards.
+      #
+      # A conversation's home directory MOVES when its cwd changes mid-session, so
+      # the index is built from each transcript's LAST recorded cwd, not from the
+      # directory name (which would be both ambiguous and stale).
+      echo "indexing conversations ..." >&2
+      IDX=$(mktemp); trap 'rm -f "$IDX"' EXIT
+      for d in "$HOME"/.claude/projects/*/; do
+        for f in "$d"*.jsonl; do
+          [ -f "$f" ] || continue
+          cwd=$(tail -80 "$f" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null | tail -1)
+          [ -n "$cwd" ] || cwd=$(head -80 "$f" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null | head -1)
+          [ -n "$cwd" ] && [ -d "$cwd" ] || continue
+          git -C "$cwd" rev-parse --show-toplevel >/dev/null 2>&1 || continue
+          printf '%s\t%s\t%s\t%s\n' "$(stat -c %Y "$f")" "$(basename "$f" .jsonl)" "$cwd" "$(stat -c %s "$f")"
+        done
+      done | sort -rn > "$IDX"
+      n=$(wc -l < "$IDX")
+      [ "$n" -gt 0 ] || { echo "no conversations found" >&2; exit 1; }
+      echo "  $n conversations across $(cut -f3 "$IDX" | sort -u | wc -l) checkouts" >&2
+
+      rows=$(while IFS=$'\t' read -r mt id cwd sz; do
+               printf '%-38s %7s  %s  %s\n' "$id" "$(numfmt --to=iec "$sz")" \
+                 "$(date -d "@$mt" '+%m-%d %H:%M')" "${cwd#$HOME/projects/}"
+             done < "$IDX")
+      if command -v fzf >/dev/null 2>&1; then
+        picked=$(printf '%s\n' "$rows" | fzf --multi --reverse --height=80% --no-sort \
+                   --prompt='select conversations (TAB to mark, ENTER to confirm) > ' \
+                   --header='newest first · size · last used · checkout')
+      else
+        printf '%s\n' "$rows" | nl -w3 -s') ' >&2
+        read -rp "numbers (space separated): " nums
+        picked=$(for i in $nums; do printf '%s\n' "$rows" | sed -n "${i}p"; done)
+      fi
+      [ -n "${picked:-}" ] || { echo "nothing selected"; exit 0; }
+
+      echo
+      total=$(printf '%s\n' "$picked" | grep -c .)
+      echo "transferring $total conversation(s)"
+      i=0; OPENED=$(mktemp)
+      printf '%s\n' "$picked" | while read -r line; do
+        id=$(printf '%s' "$line" | awk '{print $1}')
+        cwd=$(grep -P "^\d+\t$id\t" "$IDX" | cut -f3)
+        [ -n "$cwd" ] || continue
+        i=$((i+1))
+        echo
+        echo "[$i/$total] $id"
+        xfer_one "$id" "$cwd" && printf '%s\n' "$XFER_SESSION" >> "$OPENED"
+      done
+      echo
+      echo "done. open them one per terminal with:"
+      echo "  agent open          # pick from a list"
+      rm -f "$OPENED" ;;
+
+  open)
+      # Attach to a transferred conversation, creating its session on first use.
+      rows=$(kex "cat ~/.claude/handoff-index.tsv 2>/dev/null" | tr -d '\r' | sed '/^$/d')
+      [ -n "$rows" ] || { echo "nothing has been handed off yet — run 'agent handoff' or 'agent handoff-all'" >&2; exit 1; }
+      live=$(names)
+      disp=$(printf '%s\n' "$rows" | while IFS=$'\t' read -r nm id cwd; do
+               st=open; printf '%s\n' "$live" | grep -qxF "$nm" || st=new
+               printf '%-34s %-5s %s\n' "$nm" "$st" "${cwd#*/work/}"
+             done)
+      sel=$(printf '%s\n' "$disp" | pick "open" | awk '{print $1}')
+      [ -n "${sel:-}" ] || exit 0
+      rid=$(printf '%s\n' "$rows" | awk -F'\t' -v n="$sel" '$1==n{print $2; exit}')
+      if printf '%s\n' "$live" | grep -qxF "$sel"; then
+        kati "zellij attach '$sel'"
+      else
+        kati "zellij --session '$sel' -n resume-$rid"
+      fi ;;
+
+  mcp)
+      # Mirror this machine's MCP servers into the workspace.
+      #
+      # ~/.claude.json is deliberately NOT in the dotfiles repo (it holds
+      # credentials and project history), so MCP config is pushed explicitly.
+      # Servers whose command is a desktop-only binary are dropped; ones that
+      # reference a local checkout are re-pointed at the workspace's copy.
+      LOCAL_MCP="$HOME/.claude.json"
+      [ -f "$LOCAL_MCP" ] || { echo "agent mcp: no $LOCAL_MCP" >&2; exit 1; }
+
+      # jq program: rewrite each server for the server side, or drop it
+      MCP_FILTER='
+        .mcpServers
+        | with_entries(
+            .value as $v
+            | .key as $k
+            | if ($v.url // "") != "" then .                       # remote: portable
+              elif ($v.command // "") == "npx" then .              # npx: portable
+              elif $k == "pen-kube" then
+                .value = { command: "node",
+                           args: ["'"$WORKDIR"'/ai-tools/packages/pen-mcp/src/index.mjs"],
+                           env: { PEN_CONTEXT: "in-cluster",
+                                  PEN_NAMESPACE: ($v.env.PEN_NAMESPACE // "design"),
+                                  PEN_DEPLOY: ($v.env.PEN_DEPLOY // "deploy/pen-worker") } }
+              elif (($v.command // "") | startswith("/")) then empty   # desktop binary
+              else . end)'
+
+      case "${2:-status}" in
+        sync)
+            payload=$(jq -c "$MCP_FILTER" "$LOCAL_MCP" 2>/dev/null)
+            [ -n "$payload" ] && [ "$payload" != "null" ] || { echo "agent mcp: nothing to sync" >&2; exit 1; }
+            dropped=$(jq -r '.mcpServers | to_entries[]
+                             | select(((.value.url // "") == "")
+                                      and ((.value.command // "") != "npx")
+                                      and (.key != "pen-kube")
+                                      and ((.value.command // "") | startswith("/")))
+                             | .key' "$LOCAL_MCP" 2>/dev/null)
+            [ -n "$dropped" ] && printf '  skipping (desktop-only binary): %s\n' "$(printf '%s' "$dropped" | tr '\n' ' ')"
+
+            # pen-kube needs its source checkout present in the workspace
+            if printf '%s' "$payload" | jq -e 'has("pen-kube")' >/dev/null 2>&1; then
+              if ! kex "test -d '$WORKDIR/ai-tools/.git'" >/dev/null 2>&1; then
+                echo "  cloning ai-tools (pen-kube source) ..."
+                kex "mkdir -p '$WORKDIR' && gh repo clone niro58/ai-tools '$WORKDIR/ai-tools' -- -q" >/dev/null 2>&1 \
+                  || echo "  ai-tools clone failed — pen-kube will not start" >&2
+              fi
+            fi
+
+            printf '%s' "$payload" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- bash -lc '
+              cat > /tmp/mcp.json
+              [ -f ~/.claude.json ] || echo "{}" > ~/.claude.json
+              jq --slurpfile m /tmp/mcp.json ".mcpServers = \$m[0]" ~/.claude.json > /tmp/cj.$$ \
+                && mv /tmp/cj.$$ ~/.claude.json
+              rm -f /tmp/mcp.json
+              jq -r ".mcpServers | keys | join(\", \")" ~/.claude.json' \
+              | sed 's/^/  workspace now has: /'
+            echo "  (restart any running agent session for it to pick these up)" ;;
+
+        auth)
+            # Copy MCP OAuth tokens for the servers the workspace actually has.
+            #
+            # ~/.claude/.credentials.json also holds claudeAiOauth (your Claude
+            # subscription). Only the .mcpOAuth subtree is read, and only entries
+            # whose server was synced — the account token never leaves this machine.
+            CRED="$HOME/.claude/.credentials.json"
+            [ -f "$CRED" ] || { echo "agent mcp auth: no $CRED" >&2; exit 1; }
+            remote_servers=$(kex 'jq -r ".mcpServers // {} | keys | join(\" \")" ~/.claude.json 2>/dev/null' | tr -d '\r')
+            [ -n "$remote_servers" ] || { echo "agent mcp auth: run 'agent mcp sync' first" >&2; exit 1; }
+
+            now=$(date +%s)000
+            subset=$(jq -c --arg s "$remote_servers" --argjson now "$now" '
+              .mcpOAuth // {}
+              | with_entries(select((.key | split("|")[0]) as $n
+                                    | ($s | split(" ") | index($n))))' "$CRED" 2>/dev/null)
+            n=$(printf '%s' "$subset" | jq -r 'length' 2>/dev/null)
+            [ "${n:-0}" -gt 0 ] || { echo "  no matching tokens for: $remote_servers"; exit 0; }
+
+            printf '%s' "$subset" | jq -r --argjson now "$now" '
+              to_entries[]
+              | "  \(.key)  \(if (.value.expiresAt // 0) == 0 then "no expiry"
+                              elif .value.expiresAt < $now then "EXPIRED"
+                              else "valid" end)"'
+
+            printf '%s' "$subset" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- bash -lc '
+              cat > /tmp/mo.json
+              [ -f ~/.claude/.credentials.json ] || echo "{}" > ~/.claude/.credentials.json
+              jq --slurpfile m /tmp/mo.json ".mcpOAuth = ((.mcpOAuth // {}) * \$m[0])" \
+                 ~/.claude/.credentials.json > /tmp/cr.$$ \
+                && mv /tmp/cr.$$ ~/.claude/.credentials.json
+              chmod 600 ~/.claude/.credentials.json; rm -f /tmp/mo.json
+              echo "  workspace mcpOAuth entries: $(jq -r ".mcpOAuth|keys|length" ~/.claude/.credentials.json)"'
+            echo "  (restart any running session to pick them up)" ;;
+
+        status|*)
+            echo "here:"
+            jq -r '.mcpServers | to_entries[] | "  \(.key): \(.value.url // .value.command // "?")"' "$LOCAL_MCP" 2>/dev/null | cut -c1-90
+            echo "workspace:"
+            kex 'jq -r ".mcpServers // {} | to_entries[] | \"  \(.key): \(.value.url // .value.command // \"?\")\"" ~/.claude.json 2>/dev/null' \
+              | cut -c1-90 | grep . || echo "  (none)" ;;
+      esac ;;
+
   wt)
       p=$(cur_project) || { echo "agent wt: not in a git repo" >&2; exit 1; }
-      sel=$(kex "ls -1 $WORKDIR/$p/.claude/worktrees 2>/dev/null" | tr -d '\r' | sed '/^$/d' | pick "worktree")
-      [ -n "${sel:-}" ] || { echo "no server-side worktrees under $WORKDIR/$p"; exit 0; }
-      kati "cd "$WORKDIR"/$p/.claude/worktrees/$sel && zellij attach -c '$p@$sel'" ;;
+      sel=$(kex "ls -1 ~/work/$p/.claude/worktrees 2>/dev/null" | tr -d '\r' | sed '/^$/d' | pick "worktree")
+      [ -n "${sel:-}" ] || { echo "no server-side worktrees under ~/work/$p"; exit 0; }
+      kati "cd ~/work/$p/.claude/worktrees/$sel && zellij attach -c '$p@$sel'" ;;
   sync)
       # Two-way config sync. The pod is checked FIRST: a naive `chezmoi update
       # --force` there would silently discard edits made on the server.
@@ -469,7 +841,7 @@ EOF
       kex 'chezmoi update --force 2>&1 | tail -2; echo "  applied on the server"' ;;
   resume|r)
       rows=$(inv)
-      [ -n "$rows" ] || { echo "no sessions — starting one"; n=$(next_free); kati "cd "$WORKDIR" && zellij attach -c $n"; }
+      [ -n "$rows" ] || { echo "no sessions — starting one"; n=$(next_free); kati "cd ~/work && zellij attach -c $n"; }
       here=$(cur_project) || here=
       sel=$(printf '%s\n' "$rows" | awk -F'\t' -v here="$here" '
               { g=$1; sub(/@.*/,"",g); key=(g==here?"0":"1") g
@@ -483,6 +855,6 @@ EOF
       project_session auto; rc=$?
       [ $rc -eq 2 ] && exit 1
       n=$(next_free); echo "not in a git repo — scratch session: $n"
-      kati "cd "$WORKDIR" && zellij attach -c $n" ;;
+      kati "cd ~/work && zellij attach -c $n" ;;
   *)  kati "zellij attach -c '$1'" ;;
 esac
