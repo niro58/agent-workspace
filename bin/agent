@@ -413,61 +413,28 @@ case "${1:-auto}" in
         [ -n "${sel:-}" ] || exit 0
       fi
       SRC="$LOCAL_DIR/$sel.jsonl"
-      [ -f "$SRC" ] || { echo "no such conversation: $sel" >&2; exit 1; }
+      if [ ! -f "$SRC" ]; then
+        SRC=$(find "$HOME/.claude/projects" -maxdepth 2 -name "$sel.jsonl" -type f 2>/dev/null | head -1)
+      fi
+      [ -f "${SRC:-}" ] || { echo "no such conversation: $sel" >&2; exit 1; }
 
       SZ=$(du -m "$SRC" | cut -f1)
       echo "conversation  $sel  (${SZ} MB)"
-      if [ "$SZ" -gt 60 ]; then
+      if [ "$SZ" -gt 60 ] && [ -t 0 ]; then
         printf 'that is large; the copy may take a while. continue? [y/N] '
         read -r a; case "$a" in y|Y) ;; *) echo "aborted"; exit 0 ;; esac
       fi
 
-      # a conversation held in a worktree lives under that worktree's own path
-      wt=; [ "$top" = "$root" ] || wt=$(sanitize "$(basename "$top")")
-      base_name="$name"; [ -n "$wt" ] && base_name="$name@$wt"
-      REMOTE_CWD="$WORKDIR/$name"
-      [ -n "$wt" ] && REMOTE_CWD="$WORKDIR/$name/.claude/worktrees/$wt"
-      REMOTE_DIR="$REMOTE_HOME/.claude/projects/$(printf '%s' "$REMOTE_CWD" | tr '/.' '--')"
-      TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-      # rewrite embedded paths: bare form, then the JSON-escaped \/ form
-      rewrite_paths "$SRC" "$TMP/$sel.jsonl" \
-        "$top" "$REMOTE_CWD" \
-        "$root" "$WORKDIR/$name" \
-        "$HOME" "$REMOTE_HOME"
-      echo "rewrote       $top -> $REMOTE_CWD"
+      # One implementation only. This used to be a second, older copy of the
+      # transfer logic, which drifted: it lacked bundle support, did not carry
+      # uncommitted files, never registered the session for `agent open`, and
+      # referenced REMOTE_ROOT — a variable local to xfer_one — so it aborted
+      # under `set -u` the moment a worktree was involved.
+      xfer_one "$sel" "$top" || exit 1
+      [ -n "${XFER_SESSION:-}" ] || { echo "agent handoff: transfer did not complete" >&2; exit 1; }
 
-      kex "mkdir -p '$REMOTE_DIR' '$REMOTE_CWD' ~/.config/zellij/layouts" >/dev/null
-      echo "copying ..."
-      gzip -c "$TMP/$sel.jsonl" | kubectl "${KCTX[@]}" exec -i -n "$NS" "$POD" -c "$CON" -- \
-        bash -lc "gunzip > '$REMOTE_DIR/$sel.jsonl'" \
-        || { echo "agent handoff: copy failed" >&2; exit 1; }
-      kex "ls -lh '$REMOTE_DIR/$sel.jsonl' | awk '{print \"  copied \" \$5}'"
-
-      # a one-pane layout that boots straight into the resumed conversation
-      kex "printf 'layout {\n    pane command=\"%s\" cwd=\"%s\" {\n        args \"--resume\" \"%s\"\n    }\n}\n' \
-             \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
-             > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
-
-      # If we came from a worktree, make sure a REAL one exists on the server;
-      # otherwise the conversation resumes in an empty directory. This needs the
-      # branch to be reachable from the remote, so say so plainly when it is not.
-      if [ -n "$wt" ]; then
-        if ! kex "test -e '$REMOTE_ROOT/.git'" >/dev/null 2>&1; then
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-            echo "creating worktree '$wt' on the server from origin/$branch ..."
-            kex "cd '$WORKDIR/$name' && git fetch -q origin '$branch' 2>/dev/null && \
-                 git worktree add -f '$REMOTE_ROOT' '$branch' 2>&1 | tail -2" | sed 's/^/  /'
-          else
-            echo "  note: branch '$branch' is not on origin, so the server has no code for it."
-            echo "        the conversation will resume, but the working tree will be empty."
-            echo "        push the branch first if you want the files there too."
-          fi
-        fi
-      fi
-
-      s=$(uniq_name "$base_name")
-      echo "opening '$s' with the conversation resumed — then just type: continue"
-      kati "cd '$REMOTE_CWD' 2>/dev/null || cd '$WORKDIR/$name'; zellij --session '$s' -n resume-$sel" ;;
+      echo "opening '$XFER_SESSION' with the conversation resumed — then just type: continue"
+      kati "cd '$WORKDIR/$name' 2>/dev/null || cd '$WORKDIR'; zellij --session '$XFER_SESSION' -n resume-$sel" ;;
   env)
       # Encrypted project secrets. The age private key lives ONLY on this machine
       # (~/.config/sops/age/keys.txt); the workspace receives decrypted files, so a
