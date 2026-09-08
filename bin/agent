@@ -220,6 +220,9 @@ xfer_one() {
   # only what is missing from the base branch is packed. Note the remote is probed
   # with ls-remote, not local remote-tracking refs: those go stale when a branch is
   # deleted upstream, and git would then believe the commits are already published.
+  if [ -n "$wt" ] && kex "test -e '$REMOTE_ROOT/.git'" >/dev/null 2>&1; then
+    echo "  worktree already present on the server"
+  fi
   if [ -n "$wt" ] && ! kex "test -e '$REMOTE_ROOT/.git'" >/dev/null 2>&1; then
     if git -C "$top" ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
       echo "  building worktree from origin/$branch"
@@ -288,7 +291,12 @@ xfer_one() {
          \"\$HOME/.npm-global/bin/claude\" '$REMOTE_CWD' '$sel' \
          > ~/.config/zellij/layouts/resume-$sel.kdl" >/dev/null
 
-  XFER_SESSION=$(uniq_name "$base_name")
+  # Re-running a handoff for the same conversation and destination must reuse
+  # its session name. Allocating a fresh one produced repo@name-2 pointing at
+  # the identical transcript and directory.
+  XFER_SESSION=$(kex "awk -F'\t' -v i='$sel' -v c='$REMOTE_CWD' '\$2==i && \$3==c {print \$1; exit}' \
+                        ~/.claude/handoff-index.tsv 2>/dev/null" | tr -d '\r' | head -1)
+  [ -n "${XFER_SESSION:-}" ] || XFER_SESSION=$(uniq_name "$base_name")
   # register it so `agent open` can list it (one line per session, deduped)
   kex "touch ~/.claude/handoff-index.tsv
        grep -v \"^$XFER_SESSION\$(printf '\t')\" ~/.claude/handoff-index.tsv > /tmp/hi.\$\$ 2>/dev/null || true
@@ -433,6 +441,16 @@ case "${1:-auto}" in
       xfer_one "$sel" "$top" || exit 1
       [ -n "${XFER_SESSION:-}" ] || { echo "agent handoff: transfer did not complete" >&2; exit 1; }
 
+      # Attaching needs a real terminal. From a slash command or a script there
+      # is none, and zellij panics in os_input_output trying to enable raw mode
+      # — after the transfer already succeeded, which reads as a failed handoff.
+      if [ ! -t 1 ] || [ ! -t 0 ]; then
+        echo
+        echo "transfer complete. open it from a terminal with:"
+        echo "  agent open                 # pick from the list"
+        echo "  agent '$XFER_SESSION'      # or go straight to it"
+        exit 0
+      fi
       echo "opening '$XFER_SESSION' with the conversation resumed — then just type: continue"
       kati "cd '$WORKDIR/$name' 2>/dev/null || cd '$WORKDIR'; zellij --session '$XFER_SESSION' -n resume-$sel" ;;
   env)
